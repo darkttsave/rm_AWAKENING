@@ -42,7 +42,7 @@ bullet_pick_up:
     resistance: 0.092
   
 auto_exposure:
-  enable: true
+  enable: false
   target_brightness: 35.0
   tolerance: 3.0
   step_gain: 15.0
@@ -81,6 +81,7 @@ armor_detector:
   cv:
     light:
       bin_threshold: 120.0
+      net_ref_threshold_tol: 0.0
       min_wh_ratio: 0.001
       max_wh_ratio: 0.4
       max_angle: 40.0
@@ -92,24 +93,30 @@ armor_tracker:
   lost_time_thres: 0.5
   lost_time_thres_outpost: 2.0
   tracking_thres: 10
-  match_gate_armor: 50.0
-  match_gate_not_all_init_armor: 100.0
+  armor_match_gate: 50.0
+  armor_match_gate_not_all_init: 100.0
+  armor_match_w_center_err: 5.0
+  armor_match_w_angle_err: 10.0
+  armor_match_w_side_length_err: 1.0
   qxyz_common: [30.0, 30.0, 1.0]
   qyaw_common: 100.0
   qxyz_output: [1.0, 1.0, 0.5]
   qyaw_output: 0.01
   q_r: 0.0000001
-  q_l: 0.0000001
   q_h: 0.0000001
+  q_wpr: 0.00000001
   q_outpost_dz: 0.01
   enable_lights_measure: true
   light_match_length_ratio_gate: 0.2
   light_match_angle_gate: 0.2
   light_match_pos_gate_by_length_ratio: 5.0
-  r_uv_at_1m: 70.0
-  r_uv_min: 30.0
+  r_sigma_px_by_length_ratio: 0.2
+  r_sigma_length_by_length_ratio: 0.5
+  r_sigma_angle: 0.2
+  r_sigma_armor_lights_depth_diff: 0.1
   esekf_iter_num: 5
 
+  
 
 auto_aim_fsm:
   single_whole_up: 1.5 
@@ -121,6 +128,7 @@ auto_aim_fsm:
   transfer_time: 0.5
 
 very_aimer:
+  type: mpc
   base_yaw_offset: -0.0
   base_pitch_offset: 0.8
   # base_yaw_offset: -0.0
@@ -137,6 +145,7 @@ very_aimer:
   
 
   prediction_delay: 0.00
+  prediction_delay_outpost: 0.00
   aim_center_more_prediction_time: 0.0
 
   shooting_range_h: 0.12
@@ -166,7 +175,7 @@ rune_detector:
       min_free_mem_ratio: 0.1
       use_cuda_preproces: true
     rune_infer:
-      model_type: cb
+      model_type: tup
       conf_threshold: 0.2
   cv:
     bin_threshold: 70
@@ -194,8 +203,8 @@ rune_tracker:
   voter_state_need_count: 50
   voter_mode_need_count: 20
   big_args_continue_time: 1.0
-  r_uv_cv: 30.0
-  r_uv_net: 80.0
+  r_sigma_pix_by_hand_length_ratio_cv: 0.05
+  r_sigma_pix_by_hand_length_ratio_net: 0.2
 
 rune_aimer:
   base_yaw_offset: -0.0
@@ -216,7 +225,7 @@ rune_aimer:
 
 camera: 
   hik_camera:
-    target_sn: DA2166432
+    target_sn: DA4024412
     adc_bit_depth: Bits_8
     pixel_format: BayerRG8 #RGB8Packed
     reverse_x: false
@@ -323,11 +332,11 @@ armor_omni:
   fps: 60.0
   max_infer_num: 3
   armor_detector:
-    armor_infer:
-      model_type: tup
-      conf_threshold: 0.5
+    backend: tensorrt
     net_detector:
-      backend: openvino
+      armor_infer:
+        model_type: tup
+        conf_threshold: 0.5
       openvino:
         model_path: ${ROOT_DIR}/model/opt-1208-001.onnx
         device_name: "GPU"
@@ -348,31 +357,55 @@ armor_omni:
     color_classifier:
       enable: true
       diff_threshold: 20.0
+    cv:
+      light:
+        bin_threshold: 120.0
+        net_ref_threshold_tol: 0.0
+        min_wh_ratio: 0.001
+        max_wh_ratio: 0.4
+        max_angle: 40.0
+      armor:
+        min_ratio: 0.8
+        max_ratio: 5.0
   armor_tracker:
     lost_time_thres: 0.5
+    lost_time_thres_outpost: 2.0
     tracking_thres: 2
-    match_gate_at_1m: 1000.0
-    match_gate_not_all_init_at_1m: 10000.0
+    armor_match_gate: 50.0
+    armor_match_gate_not_all_init: 100.0
+    armor_match_w_center_err: 5.0
+    armor_match_w_angle_err: 10.0
+    armor_match_w_side_length_err: 1.0
     qxyz_common: [20.0, 20.0, 1.0]
     qyaw_common: 10.0
     qxyz_output: [10.0, 10.0, 0.5]
     qyaw_output: 0.01
     q_r: 0.0000001
-    q_l: 0.0000001
     q_h: 0.0000001
+    q_wpr: 0.00000001
     q_outpost_dz: 0.5
-    r_uv_at_1m: 100.0
-    r_uv_min: 30.0
+    enable_lights_measure: false
+    light_match_length_ratio_gate: 0.2
+    light_match_angle_gate: 0.2
+    light_match_pos_gate_by_length_ratio: 5.0
+    r_sigma_px_by_length_ratio: 0.2
+    r_sigma_length_by_length_ratio: 0.5
+    r_sigma_angle: 0.2
+    r_sigma_armor_lights_depth_diff: 0.1
     esekf_iter_num: 1
   camera0:
     uvc_camera:
-      device_name: "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2.4:1.0-video-index0"
+      device_name: "/dev/v4l/by-path/platform-3610000.usb-usb-0:2.5.1:1.0-video-index0"
       fps: 30
       width: 1280
       height: 720
-      exposure: 50
-      gain: 10.0
       gamma: 100
+      brightness: 25
+      contrast: 15
+      saturation: 32
+      sharpness: 32
+      auto_white_balance: true
+      white_balance_temperature: 5000
     camera_info:
       image_width: 1440
       image_height: 1080
@@ -400,13 +433,17 @@ armor_omni:
                   0.     ,    0.     ,    1.     ,    0.     ]
   camera1:
     uvc_camera:
-      device_name: "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2.1:1.0-video-index0"
+      device_name: "/dev/v4l/by-path/platform-3610000.usb-usb-0:2.5.2:1.0-video-index0"
       fps: 30
       width: 1280
       height: 720
-      exposure: 50
-      gain: 10.0
       gamma: 100
+      brightness: 25
+      contrast: 15
+      saturation: 32
+      sharpness: 32
+      auto_white_balance: true
+      white_balance_temperature: 5000
     camera_info:
       image_width: 1440
       image_height: 1080
@@ -470,7 +507,7 @@ uvc_camera_test:
 
 
 brain:
-  enable: true
+  enable: false
   mode: home
   
   home: 

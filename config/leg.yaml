@@ -16,11 +16,15 @@ record:
 
 tf:
   camera_in_gimbal:
-    t: [0.05,0.0,0.1]
-    R: [1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]
+    t: [0.13392043908386911, 0.083814678300799167, 0.0024113281705605569]
+    R:  [0.012677749543071874, -0.05027855083870178, 0.99865476616901172,
+        -0.99943629031167858, -0.031686926874944406, 0.011092352016221671,
+         0.031086593164143677, -0.99823244086273921, -0.050651927255189445]
   shoot_in_gimbal:
-    t: [0.1,0.0,0.0]
-    R: [1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]
+    t: [0.21881, 0.0, 0.15]
+    R: [1.0,0.0,0.0,
+        0.0,1.0,0.0,
+        0.0,0.0,1.0]
 wheel_odometry:
   q_xyz: [10.0,10.0,1.0]
   r_vxyz: [0.05,0.05,0.05]
@@ -32,7 +36,7 @@ bullet_pick_up:
   
 auto_exposure:
   enable: true
-  target_brightness: 35.0
+  target_brightness: 35.0                    #35.0
   tolerance: 3.0
   step_gain: 15.0
   decay_step: 1.0
@@ -43,7 +47,7 @@ auto_exposure:
 
 armor_detector:
   max_infer_num: 5
-  backend: tensorrt
+  backend: openvino                     #tensorrt
   net_detector:
     openvino:
       model_path: ${ROOT_DIR}/model/opt-1208-001.onnx
@@ -81,31 +85,31 @@ armor_detector:
 
 
 armor_tracker:
-  lost_time_thres: 1.5
+  lost_time_thres: 0.5
   lost_time_thres_outpost: 2.0
   tracking_thres: 10
-  qxyz_common: [30.0, 30.0, 1.0]
-  qyaw_common: 30.0
-  qxyz_output: [1.0, 1.0, 1.0]
+  qxyz_common: [30.0, 30.0, 0.1]
+  qyaw_common: 200.0
+  qxyz_output: [0.0000000001, 0.00000000001, 0.000000000001]
   qyaw_output: 0.01
   q_r: 0.0000001
   q_l: 0.0000001
   q_h: 0.0000001
-  q_wpr: 0.0000001
+  q_wpr: 0.00000001
   q_outpost_dz: 0.0000001
-  enable_lights_measure: true
+  enable_lights_measure: false
   armor_match_gate: 300.0
   armor_match_gate_not_all_init: 1000.0
-  armor_match_w_center_err: 5.0
-  armor_match_w_angle_err: 10.0
+  armor_match_w_center_err: 1.0
+  armor_match_w_angle_err: 5.0
   armor_match_w_side_length_err: 1.0
-  light_match_length_ratio_gate: 0.2
-  light_match_angle_gate: 0.2
+  light_match_length_ratio_gate: 0.02
+  light_match_angle_gate: 0.02
   light_match_pos_gate_by_length_ratio: 5.0
-  r_sigma_px_by_length_ratio: 0.2
+  r_sigma_px_by_length_ratio: 0.9
   r_sigma_length_by_length_ratio: 0.5
-  r_sigma_angle: 0.5
-  r_sigma_armor_lights_depth_diff: 0.1
+  r_sigma_angle: 0.2
+  r_sigma_armor_lights_depth_diff: 10.0
   esekf_iter_num: 5
 
 
@@ -113,36 +117,37 @@ armor_tracker:
 auto_aim_fsm:
   single_whole_up: 1.5 
   single_whole_down: 1.0
-  whole_pair_up: 17.5 
+  whole_pair_up: 17.0 
   whole_pair_down: 6.5 #1s内至少换2次板子  2pi  否则轨迹规划无意义
-  pair_center_up: 16.5
-  pair_center_down: 15.0
+  pair_center_up: 12.5
+  pair_center_down: 9.0
   transfer_time: 0.5
 
 very_aimer:
-  type: mpc
-  base_yaw_offset: -0.0
-  base_pitch_offset: 1.0
-  sample_total_time: 0.5
-  sample_horizon: 100
-  fire_delay_min: 0.05
-  fire_delay_max: 0.07
-  max_yaw_acc: 100
-  max_pitch_acc: 50
-  prediction_delay: 0.00
+  type: m
+  base_yaw_offset: -0.5
+  base_pitch_offset: 0.0
+  sample_total_time: 1.0
+  sample_horizon: 200
+  fire_delay_min: 0.02
+  fire_delay_max: 0.04
+  max_yaw_acc: 50
+  max_pitch_acc: 10
+  prediction_delay: 0.07
+  prediction_delay_outpost: 0.115
   aim_center_more_prediction_time: 0.0
   shooting_range_h: 0.05
   shooting_range_w_small: 0.1
   shooting_range_w_large: 0.24
   min_enable_pitch_deg: 0.5
-  min_enable_yaw_deg: 0.5
+  min_enable_yaw_deg: 0.25
   ballistic_trajectory:
     gravity: 9.8
     resistance: 0.001
 
 rune_detector:
   max_infer_num: 5
-  backend: tensorrt
+  backend: openvino
   net_detector:
     openvino:
       model_path: ${ROOT_DIR}/model/cb_rune.onnx
@@ -158,7 +163,7 @@ rune_detector:
       min_free_mem_ratio: 0.1
       use_cuda_preproces: true
     rune_infer:
-      model_type: cb
+      model_type: tup
       conf_threshold: 0.2
   cv:
     bin_threshold: 70
@@ -183,7 +188,7 @@ rune_tracker:
   q_a: 0.01
   q_w: 0.01
   q_tau: 0.01
-  match_gate: 30.0
+  match_gate: 300.0
   voter_state_need_count: 50
   voter_mode_need_count: 20
   big_args_continue_time: 1.0
@@ -191,11 +196,11 @@ rune_tracker:
   r_sigma_pix_by_hand_length_ratio_net: 0.2
 
 rune_aimer:
-  base_yaw_offset: -0.0
-  base_pitch_offset: -0.5
+  base_yaw_offset: 0.0
+  base_pitch_offset: 80.0
   sample_total_time: 0.5
   sample_horizon: 10
-  prediction_delay: -0.00
+  prediction_delay: 0.10
   max_yaw_acc: 40 
   max_pitch_acc: 50
   shooting_range_h: 0.12
@@ -206,10 +211,10 @@ rune_aimer:
     gravity: 9.8
     resistance: 0.001
 
-camera: 
+camera:
   type: hik
   hik_camera:
-    target_sn: DA2166465
+    target_sn: DA4024410                   #DA4024412
     adc_bit_depth: Bits_8
     pixel_format: BayerRG8 #RGB8Packed
     reverse_x: false
@@ -256,34 +261,34 @@ camera:
     #   data: [2413.22632,    0.     ,  717.5196 ,    0.     ,
     #             0.     , 2408.83228,  537.43444,    0.     ,
     #             0.     ,    0.     ,    1.     ,    0.     ]
-    #6mm
 
+    #6mm
     image_width: 1440
     image_height: 1080
     camera_name: narrow_stereo
     camera_matrix:
       rows: 3
       cols: 3
-      data: [1814.19888,    0.     ,  730.27359,
-                0.     , 1807.37177,  529.57031,
-                0.     ,    0.     ,    1.     ]
+      data: [2412.8410330856691, 0, 724.02650872084621,
+             0, 2412.0961569704896, 563.9481193226045,
+             0, 0, 1]
     distortion_model: plumb_bob
     distortion_coefficients:
       rows: 1
       cols: 5
-      data: [-0.089138, 0.114766, 0.000034, 0.000238, 0.000000]
+      data: [-0.030517930083123486, 0.13056173254457884, 0.00076663960143516204, 0.0010875495010853129, 0]
     rectification_matrix:
       rows: 3
       cols: 3
-      data: [1., 0., 0.,
-            0., 1., 0.,
-            0., 0., 1.]
+      data: [1.0, 0.0, 0.0,
+             0.0, 1.0, 0.0,
+             0.0, 0.0, 1.0]
     projection_matrix:
       rows: 3
       cols: 4
-      data: [1793.54229,    0.     ,  730.67194,    0.     ,
-                0.     , 1794.48784,  529.46193,    0.     ,
-                0.     ,    0.     ,    1.     ,    0.     ]
+      data: [1796.07647280, 0.0,           716.19798699, 0.0,
+            0.0,            1795.35151508, 554.50387236, 0.0,
+            0.0,            0.0,           1.0,          0.0]
     #12mm
     # image_width: 1440
     # image_height: 1080

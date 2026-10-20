@@ -81,6 +81,7 @@ armor_detector:
   cv:
     light:
       bin_threshold: 120.0
+      net_ref_threshold_tol: 0.0
       min_wh_ratio: 0.001
       max_wh_ratio: 0.4
       max_angle: 40.0
@@ -215,9 +216,10 @@ rune_aimer:
     gravity: 9.8
     resistance: 0.001
 
-camera: 
+camera:
+  type: hik
   hik_camera:
-    target_sn: DA2166360
+    target_sn: DA4024412
     adc_bit_depth: Bits_8
     pixel_format: BayerRG8 #RGB8Packed
     reverse_x: false

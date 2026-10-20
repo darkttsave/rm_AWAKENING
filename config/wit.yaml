@@ -3,7 +3,7 @@ enemy_color: red
 bullet_speed: 20.5
 
 serial:
-  enable: true
+  enable: false
   device_name: /dev/gimbal
   baud_rate: 115200
   char_size: 8
