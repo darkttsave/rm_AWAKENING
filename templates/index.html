@@ -24,6 +24,10 @@
         <span id="data-status" class="status-pill">DATA</span>
         <span id="log-status" class="status-pill">LOG</span>
       </div>
+      <nav class="tab-nav">
+        <button class="tab-btn active" data-tab="main">主相机</button>
+        <button class="tab-btn" data-tab="omni">Omni</button>
+      </nav>
     </header>
 
     <main id="video-tab">
@@ -96,6 +100,29 @@
             <h2>独立图表</h2>
           </div>
           <div id="individualCharts"></div>
+        </article>
+      </section>
+    </main>
+
+    <main id="omni-tab" hidden>
+      <section id="omni-grid" aria-label="Omni相机面板">
+        <article class="panel" id="omni-panel-0">
+          <div class="panel-title">
+            <h2>Omni Camera 0</h2>
+            <button class="icon-btn fullscreen-btn" type="button" data-omni="0" title="全屏">⛶</button>
+          </div>
+          <div class="video-container" id="omni-container-0">
+            <img src="{{ url_for('video_feed_omni', idx=0) }}" alt="Omni 0" decoding="async" />
+          </div>
+        </article>
+        <article class="panel" id="omni-panel-1">
+          <div class="panel-title">
+            <h2>Omni Camera 1</h2>
+            <button class="icon-btn fullscreen-btn" type="button" data-omni="1" title="全屏">⛶</button>
+          </div>
+          <div class="video-container" id="omni-container-1">
+            <img src="{{ url_for('video_feed_omni', idx=1) }}" alt="Omni 1" decoding="async" />
+          </div>
         </article>
       </section>
     </main>

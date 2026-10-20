@@ -24,6 +24,11 @@ shared_size = 2 * 1024 * 1024  # 2MB
 data_path = "/dev/shm/awakening_data.json"
 log_path = "/dev/shm/awakening_log.json"
 
+OMNI_SHM_PATHS = [
+    "/dev/shm/awakening_omni_0",
+    "/dev/shm/awakening_omni_1",
+]
+
 port = 9000
 
 fd = None
@@ -36,6 +41,18 @@ latest_seq = 0
 frame_cond = threading.Condition()
 stop_event = threading.Event()
 reader_thread = None
+
+# Per-omni-stream state
+class OmniStream:
+    def __init__(self):
+        self.latest_jpg = None
+        self.latest_seq = 0
+        self.cond = threading.Condition()
+        self.fd = None
+        self.mapfile = None
+        self.active = False
+
+omni_streams = [OmniStream(), OmniStream()]
 
 json_cache_lock = threading.Lock()
 json_cache = {}
@@ -208,6 +225,57 @@ def frame_reader_loop():
         time.sleep(0.2)
 
 
+def _read_jpeg_from_shm_path(path: str):
+    """Read one JPEG frame from an arbitrary shm file path."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        mm = mmap.mmap(fd, shared_size, access=mmap.ACCESS_READ)
+        try:
+            mm.seek(0)
+            size_bytes = mm.read(4)
+            if len(size_bytes) != 4:
+                return None
+            jpg_size = struct.unpack("<I", size_bytes)[0]
+            if not (0 < jpg_size <= shared_size - 4):
+                return None
+            data = mm.read(jpg_size)
+            if len(data) != jpg_size or not data.startswith(b"\xff\xd8"):
+                return None
+            return data
+        finally:
+            mm.close()
+    except Exception:
+        return None
+    finally:
+        os.close(fd)
+
+
+def omni_reader_loop(idx: int):
+    """Background thread reading one omni camera shm stream."""
+    stream = omni_streams[idx]
+    shm_path = OMNI_SHM_PATHS[idx]
+    last_fix_attempt = 0.0
+
+    while not stop_event.is_set():
+        jpg = _read_jpeg_from_shm_path(shm_path)
+        if jpg is not None:
+            with stream.cond:
+                stream.latest_jpg = jpg
+                stream.latest_seq += 1
+                stream.active = True
+                stream.cond.notify_all()
+            time.sleep(FRAME_INTERVAL)
+            continue
+
+        now = time.time()
+        if now - last_fix_attempt > 5.0:
+            last_fix_attempt = now
+        time.sleep(0.2)
+
+
 @atexit.register
 def cleanup():
     global mapfile, fd, stop_event
@@ -256,6 +324,33 @@ def mjpeg_stream():
         )
 
 
+def mjpeg_stream_omni(idx: int):
+    """MJPEG generator for one omni camera stream."""
+    stream = omni_streams[idx]
+    last_seq = -1
+
+    while not stop_event.is_set():
+        with stream.cond:
+            stream.cond.wait_for(
+                lambda: stream.latest_seq != last_seq or stop_event.is_set(),
+                timeout=1.0,
+            )
+            if stop_event.is_set():
+                break
+            frame = stream.latest_jpg
+            last_seq = stream.latest_seq
+
+        if frame is None:
+            continue
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" +
+            frame +
+            b"\r\n"
+        )
+
+
 @app.route("/")
 def index():
     url = f"http://{get_local_ip()}:{port}"
@@ -266,6 +361,19 @@ def index():
 def video_feed():
     response = Response(
         mjpeg_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+@app.route("/video/omni/<int:idx>")
+def video_feed_omni(idx: int):
+    if idx not in (0, 1):
+        return "invalid index", 400
+    response = Response(
+        mjpeg_stream_omni(idx),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
     response.headers["Cache-Control"] = "no-store, max-age=0"
@@ -299,6 +407,10 @@ if __name__ == "__main__":
 
     reader_thread = threading.Thread(target=frame_reader_loop, daemon=True)
     reader_thread.start()
+
+    for i in range(len(OMNI_SHM_PATHS)):
+        t = threading.Thread(target=omni_reader_loop, args=(i,), daemon=True)
+        t.start()
 
     url = f"http://{get_local_ip()}:{port}"
     print(f"✅ Web 调试器已启动: {url}")

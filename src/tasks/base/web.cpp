@@ -5,6 +5,7 @@
 #include "utils/common/type_common.hpp"
 #include "utils/utils.hpp"
 #include <array>
+#include <unordered_map>
 #include <memory>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/types.hpp>
@@ -685,6 +686,45 @@ struct Web::Impl {
         w.write(img);
     }
 
+    static void write_shm_to(const cv::Mat& img, const char* shm_name) {
+        constexpr size_t shm_max_size = 2 * 1024 * 1024;
+        struct shm_writer {
+            int fd_ { -1 };
+            void* ptr_ { nullptr };
+            shm_writer(const char* name) {
+                fd_ = shm_open(name, O_CREAT | O_RDWR, 0666);
+                if (fd_ == -1) { AWAKENING_ERROR("shm: {} open failed", name); return; }
+                if (ftruncate(fd_, shm_max_size) == -1) {
+                    AWAKENING_ERROR("shm: {} ftruncate failed", name); close(fd_); fd_ = -1; return;
+                }
+                ptr_ = mmap(nullptr, shm_max_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+                if (ptr_ == MAP_FAILED) {
+                    AWAKENING_ERROR("shm: {} mmap failed", name); close(fd_); fd_ = -1; ptr_ = nullptr;
+                }
+            }
+            ~shm_writer() {
+                if (ptr_) munmap(ptr_, shm_max_size);
+                if (fd_ != -1) close(fd_);
+            }
+            void write(const cv::Mat& img) {
+                if (!ptr_) return;
+                static const std::vector<int> jpeg_params = { cv::IMWRITE_JPEG_QUALITY, 75 };
+                std::vector<uchar> buf;
+                cv::imencode(".jpg", img, buf, jpeg_params);
+                if (buf.size() + 4 > shm_max_size) return;
+                uint32_t size = static_cast<uint32_t>(buf.size());
+                std::memcpy(ptr_, &size, 4);
+                std::memcpy(static_cast<char*>(ptr_) + 4, buf.data(), size);
+            }
+        };
+        static std::unordered_map<std::string, std::unique_ptr<shm_writer>> writers;
+        static std::mutex writers_mtx;
+        std::lock_guard<std::mutex> lock(writers_mtx);
+        auto [it, inserted] = writers.emplace(shm_name, nullptr);
+        if (inserted) it->second = std::make_unique<shm_writer>(shm_name);
+        it->second->write(img);
+    }
+
     template<typename T, int MAX_N>
     class DatasStream {
     public:
@@ -782,5 +822,8 @@ void Web::write_debug_data(const VisionDebugCtx& ctx) {
 }
 void Web::write_shm(const cv::Mat& img) {
     _impl->write_shm(img);
+}
+void Web::write_shm_to(const cv::Mat& img, const char* shm_name) {
+    Impl::write_shm_to(img, shm_name);
 }
 } // namespace awakening

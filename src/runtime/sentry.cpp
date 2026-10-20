@@ -749,6 +749,20 @@ int main(int argc, char** argv) {
                 one.armors_queue->enqueue(armors);
             }
 
+            // Write omni frame to shared memory for web preview
+            if (!f.img_frame.src_img.empty()) {
+                cv::Mat omni_bgr;
+                if (f.img_frame.format == PixelFormat::RGB) {
+                    cv::cvtColor(f.img_frame.src_img, omni_bgr, cv::COLOR_RGB2BGR);
+                } else {
+                    omni_bgr = f.img_frame.src_img;
+                }
+                const char* shm_name =
+                    (one.cv_frame_id == std::to_underlying(SentryFrame::OMNI_0_CV))
+                    ? "/awakening_omni_0" : "/awakening_omni_1";
+                Web::write_shm_to(omni_bgr, shm_name);
+            }
+
             auto batch_armors = one.armors_queue->dequeue_batch();
             {
                 static std::mutex mutex;

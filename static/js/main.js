@@ -1,12 +1,22 @@
 const LOG_POLL_INTERVAL_MS = 500;
 const VIDEO_VIEWPORT_GAP_PX = 12;
 
-function updateVideoPanelHeightLimit() {
-  const panel = document.getElementById("video-panel");
-  if (!panel || document.fullscreenElement) return;
+function switchTab(name) {
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === name);
+  });
+  const mainTab = document.getElementById("video-tab");
+  const omniTab = document.getElementById("omni-tab");
+  if (mainTab) mainTab.hidden = name !== "main";
+  if (omniTab) omniTab.hidden = name !== "omni";
+  updateVideoPanelHeightLimit();
+}
 
-  const panelTop = panel.getBoundingClientRect().top;
-  const availableHeight = Math.max(160, window.innerHeight - panelTop - VIDEO_VIEWPORT_GAP_PX);
+function updateVideoPanelHeightLimit() {
+  if (document.fullscreenElement) return;
+  const header = document.getElementById("header");
+  const headerH = header ? header.offsetHeight : 86;
+  const availableHeight = Math.max(160, window.innerHeight - headerH - 24);
   document.documentElement.style.setProperty("--video-panel-max-height", `${availableHeight}px`);
 }
 
@@ -36,6 +46,23 @@ function bindControls() {
   });
   document.getElementById("applyMainRange")?.addEventListener("click", updateMainRange);
 
+  document.querySelectorAll(".fullscreen-btn[data-omni]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = btn.dataset.omni;
+      const container = document.getElementById(`omni-container-${idx}`);
+      if (!container) return;
+      if (!document.fullscreenElement) {
+        container.requestFullscreen()
+          .then(() => document.body.classList.add("fullscreen-mode"))
+          .catch((e) => console.warn(`omni fullscreen failed: ${e.message}`));
+      } else {
+        document.exitFullscreen()
+          .then(() => document.body.classList.remove("fullscreen-mode"))
+          .catch((e) => console.warn(`exit fullscreen failed: ${e.message}`));
+      }
+    });
+  });
+
   document.addEventListener("fullscreenchange", () => {
     document.body.classList.toggle("fullscreen-mode", Boolean(document.fullscreenElement));
     if (!document.fullscreenElement) updateVideoPanelHeightLimit();
@@ -52,4 +79,8 @@ document.addEventListener("DOMContentLoaded", () => {
   startDataLoop();
   fetchAndDisplayJsonWithTree("json-log", "/log");
   setInterval(() => fetchAndDisplayJsonWithTree("json-log", "/log"), LOG_POLL_INTERVAL_MS);
+
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+  });
 });

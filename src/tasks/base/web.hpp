@@ -52,6 +52,7 @@ public:
     void draw(cv::Mat& img, const VisionDebugCtx& ctx);
     void write_debug_data(const VisionDebugCtx& ctx);
     void write_shm(const cv::Mat& img);
+    static void write_shm_to(const cv::Mat& img, const char* shm_name);
     struct LogBuffer {
         std::mutex mtx;
         nlohmann::json j;
