@@ -23,6 +23,7 @@ struct VeryAimer::Impl {
         double max_yaw_acc;
         double max_pitch_acc;
         double prediction_delay;
+        double prediction_delay_outpost;
         double aim_center_more_prediction_time;
         double shooting_range_h;
         double shooting_range_w_small;
@@ -38,6 +39,7 @@ struct VeryAimer::Impl {
             max_yaw_acc = config["max_yaw_acc"].as<double>();
             max_pitch_acc = config["max_pitch_acc"].as<double>();
             prediction_delay = config["prediction_delay"].as<double>();
+            prediction_delay_outpost = config["prediction_delay_outpost"].as<double>();
             aim_center_more_prediction_time =
                 config["aim_center_more_prediction_time"].as<double>();
             shooting_range_h = config["shooting_range_h"].as<double>();
@@ -265,9 +267,12 @@ struct VeryAimer::Impl {
             }
             prev_fly_time = iter_pitch_and_fly_time_opt.value().second;
         }
-        const double predict_time = prev_fly_time + params_.prediction_delay
+        const double predict_time = prev_fly_time
+            + (hit_time_target.target_number == ArmorClass::OUTPOST
+                ? params_.prediction_delay_outpost
+                : params_.prediction_delay)
             + (fsm == AutoAimFsm::AIM_WHOLE_CAR_CENTER ? params_.aim_center_more_prediction_time : 0
-            ); //瞄准中间只能预测一段发弹延迟
+            );
         hit_time_target.set_target_state([&](auto& state) {
             state.predict(predict_time, hit_time_target.target_number);
         });

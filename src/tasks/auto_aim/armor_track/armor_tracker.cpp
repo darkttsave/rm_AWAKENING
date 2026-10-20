@@ -66,11 +66,13 @@ struct ArmorTracker::Impl {
         const auto valid_target = [&](Armor& armor) {
             const bool valid_color =
                 armor.color != ArmorColor::NONE && armor.color != ArmorColor::PURPLE;
+            const bool valid_number =
+                armor.number != ArmorClass::BASE && armor.number != ArmorClass::NO2;
             const bool keep_outpost =
                 target_buf_[cur_target_idx_].target_number == ArmorClass::OUTPOST
                 && armor.number != ArmorClass::OUTPOST && target_buf_[cur_target_idx_].check();
             const bool pnp_ok = ArmorTarget::armor_pnp(armor, camera_info, camera_cv_in_odom);
-            return valid_color && !keep_outpost && pnp_ok;
+            return valid_color && valid_number && !keep_outpost && pnp_ok;
         };
         Armor* selected_armor = nullptr;
         auto min_dis = std::numeric_limits<double>::max();

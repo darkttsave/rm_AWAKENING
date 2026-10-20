@@ -445,11 +445,9 @@ int ArmorTarget::update(
                 measure_diff,
                 [&](const DiffVecZ& z) {
                     Eigen::Matrix<double, DIFFZ_N, DIFFZ_N> r;
-                    r.setZero();
                     auto r_sigma = cfg.r_sigma_armor_lights_depth_diff;
                     // / std::abs(z[0] / getArmorWH(target_number).first); //实际触发到这里的情况深度差都不大，这么映射太猛了
-                    r(0, 0) = r_sigma * r_sigma / 2.0;
-                    r(1, 1) = r_sigma * r_sigma / 2.0;
+                    r.setConstant(r_sigma * r_sigma / 2.0); //DIFFZ_N 为 1 时不能下标写 (1,1)
                     return r;
                 },
                 [](const DiffVecZ& z_pred, const DiffVecZ& z) {

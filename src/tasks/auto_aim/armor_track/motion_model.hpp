@@ -188,19 +188,7 @@ struct Predict {
 
         if (armor_number != auto_aim::ArmorClass::BASE) {
             Eigen::Matrix<T, 3, 1> delta_rot;
-            if (armor_number == ArmorClass::OUTPOST) {
-                if (voter.state == Voter::Clockwise) {
-                    delta_rot << T(0), T(0), T(OUTPOST_WZ) * T(dt);
-                    x1[idx::VYAW] = T(OUTPOST_WZ);
-                } else if (voter.state == Voter::Counterclockwise) {
-                    delta_rot << T(0), T(0), -T(OUTPOST_WZ) * T(dt);
-                    x1[idx::VYAW] = -T(OUTPOST_WZ);
-                } else {
-                    delta_rot << T(0), T(0), x0[idx::VYAW] * T(dt);
-                }
-            } else {
-                delta_rot << T(0), T(0), x0[idx::VYAW] * T(dt);
-            }
+            delta_rot << T(0), T(0), x0[idx::VYAW] * T(dt);
 
             const Eigen::Matrix<T, 3, 3> R1 =
                 (utils::so3_exp(
