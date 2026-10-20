@@ -11,10 +11,10 @@ set(CMAKE_BUILD_TYPE "Release")
 message(STATUS "--------------------CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}--------------------")
 
 #修改以下option需要rebuild清除缓存才能生效
-option(BUILD_WITH_TRT      "Enable TensorRT backend"   ON)
+option(BUILD_WITH_TRT      "Enable TensorRT backend"   OFF)
 option(BUILD_WITH_OPENVINO "Enable OpenVINO backend"   ON)
 option(BUILD_SENTRY "Enable Sentry"   ON)
-option(BUILD_RADAR "Enable Radar"   ON)
+option(BUILD_RADAR "Enable Radar"   OFF)
 option(BUILD_RUNTIME_TESTS "Build runtime test executables by default" ON)
 option(BUILD_WITH_PCH "Enable precompiled headers for C++ targets" ON)
 option(BUILD_WITH_Daedalus "Enable Daedalus interface" ON)
@@ -111,6 +111,7 @@ configure_file(
 )
 add_library(relink SHARED src/relink.cpp)
 awakening_enable_pch(relink)
+target_link_libraries(relink Eigen3::Eigen)
 include_directories(${PROJECT_NAME}_utils PUBLIC
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/3rdparty
@@ -118,6 +119,7 @@ include_directories(${PROJECT_NAME}_utils PUBLIC
     ${OpenCV_INCLUDE_DIRS}
 )
 file(GLOB_RECURSE UTILS_SOURCES  src/utils/*.cpp 3rdparty/*.cpp 3rdparty/*.c)
+list(FILTER UTILS_SOURCES EXCLUDE REGEX "/3rdparty/backward-cpp/(test|test_package)/")
 if(BUILD_WITH_TRT)
     file(GLOB_RECURSE UTILS_CUDA_SOURCES  src/utils/*.cu)
     list(APPEND UTILS_SOURCES ${UTILS_CUDA_SOURCES})

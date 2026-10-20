@@ -23,6 +23,7 @@ reset="\033[0m"
 if [ "$EUID" -eq 0 ]; then
     USER_HOME=$(getent passwd $SUDO_USER | cut -d: -f6)
     COPY_BASHRC="$WORK_DIR/output/user_bashrc_copy.bash"
+    mkdir -p "$WORK_DIR/output"
     if [ -f "$USER_HOME/.bashrc" ]; then
         tail -n +11 "$USER_HOME/.bashrc" > "$COPY_BASHRC"
         chmod 644 "$COPY_BASHRC"
@@ -65,8 +66,8 @@ do_build() {
     echo -e "${yellow}<--- Start CMake (Ninja) --->${reset}"
     cmake -S "$WORK_DIR" -B "$BUILD_DIR" \
         -G Ninja \
-        -DCMAKE_C_COMPILER=clang \
-        -DCMAKE_CXX_COMPILER=clang++
+        -DCMAKE_C_COMPILER=gcc-12 \
+        -DCMAKE_CXX_COMPILER=g++-12
     if [ $? -ne 0 ]; then
         echo -e "${red}--- CMake Failed ---${reset}"
         exit 1

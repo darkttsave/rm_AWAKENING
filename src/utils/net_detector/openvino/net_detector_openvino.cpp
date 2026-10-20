@@ -116,7 +116,13 @@ struct NetDetectorOpenVINO::Impl {
                 m.emplace(ov::hint::execution_mode(execution_mode.value()));
             }
             if (priority.has_value()) {
-                m.emplace(ov::hint::model_priority(priority.value()));
+                const bool supports_model_priority =
+                    device_name.find("AUTO") != std::string::npos ||
+                    device_name.find("MULTI") != std::string::npos ||
+                    device_name.find("HETERO") != std::string::npos;
+                if (supports_model_priority) {
+                    m.emplace(ov::hint::model_priority(priority.value()));
+                }
             }
             // if (distribution_policy.has_value()) {
             //     m.emplace(ov::hint::model_distribution_policy(distribution_policy.value()));
