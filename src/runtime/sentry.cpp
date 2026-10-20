@@ -325,11 +325,7 @@ int main(int argc, char** argv) {
                 auto packet_time =
                     now - std::chrono::microseconds(serial_send_to_image_microseconds);
                 ISO3 gimbal_in_gimbal_odom = ISO3::Identity();
-                gimbal_in_gimbal_odom.linear() = utils::rpy2matrix(Vec3(
-                    angles::from_degrees(robo.roll),
-                    angles::from_degrees(robo.pitch),
-                    angles::from_degrees(robo.yaw)
-                ));
+                gimbal_in_gimbal_odom.linear() = utils::rpy2matrix(Vec3(robo.roll, robo.pitch, robo.yaw));
                 tf->push(
                     SentryFrame::GIMBAL_ODOM,
                     SentryFrame::GIMBAL,
@@ -345,6 +341,9 @@ int main(int argc, char** argv) {
                     gimbal_odom_in_odom
                 );
                 enemy_color = EnemyColor(robo.detect_color);
+                if (robo.shutdown) {
+                    std::system("shutdown -h now");
+                }
                 robo.update_log(delay);
                 if (robo.bullet_count > last_bullet_count) {
                     bullet_pick_up.push_back(Bullet {
@@ -361,7 +360,7 @@ int main(int argc, char** argv) {
                 auto gimbal_2_gimbal_odom =
                     tf->pose_a_in_b(SentryFrame::GIMBAL, SentryFrame::GIMBAL_ODOM, Clock::now());
                 auto rpy = utils::matrix2rpy<double>(gimbal_2_gimbal_odom.linear());
-                rpy[2] = angles::from_degrees(joint.big_yaw_in_world);
+                rpy[2] = joint.big_yaw_in_world;
                 rpy[1] = 0.0;
                 ISO3 big_yaw_2_gimbal_odom = ISO3::Identity();
                 big_yaw_2_gimbal_odom.translation() = Vec3(0, 0, 0.0);
@@ -680,7 +679,10 @@ int main(int argc, char** argv) {
             send.v_pitch = cmd.v_pitch, send.a_yaw = cmd.a_yaw, send.a_pitch = cmd.a_pitch;
             send.enable_yaw_diff = cmd.enable_yaw_diff;
             send.enable_pitch_diff = cmd.enable_pitch_diff;
-            serial->write(std::move(utils::to_vector(send)));
+            send.track_id = static_cast<uint8_t>(a_target.target_number);
+            if (utils::is_finite(send)) {
+                serial->write(std::move(utils::to_vector(send)));
+            }
         }
         auto old_in_camera_cv = tf->pose_a_in_b(
             SentryFrame(cmd.aim_point.frame_id),
@@ -828,7 +830,7 @@ int main(int argc, char** argv) {
                 tf->pose_a_in_b(SentryFrame::GIMBAL, SentryFrame::GIMBAL_ODOM, Clock::now());
             auto rpy = utils::matrix2rpy<double>(gimbal_in_gimbal_odom.linear());
             auto gimbal_yaw_pitch =
-                std::make_pair(angles::to_degrees(rpy[2]), -angles::to_degrees(rpy[1]));
+                std::make_pair(rpy[2], -rpy[1]);
             dbg->gimbal_yaw_pitch.set(gimbal_yaw_pitch);
             web.write_debug_data(dbg.value());
             bullet_pick_up.update(

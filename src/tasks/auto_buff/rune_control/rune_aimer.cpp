@@ -313,14 +313,14 @@ struct RuneAimer::Impl {
         double target_pitch =
             angles::normalize_angle(target_gimbal_state.pitch_state.p + target_traj_cp0.pitch);
         cmd.timestamp = Clock::now();
-        cmd.yaw = angles::to_degrees(control_yaw);
-        cmd.v_yaw = angles::to_degrees(control.yaw_state.v);
-        cmd.a_yaw = angles::to_degrees(control.yaw_state.a);
-        cmd.pitch = angles::to_degrees(control_pitch);
-        cmd.v_pitch = angles::to_degrees(control.pitch_state.v);
-        cmd.a_pitch = angles::to_degrees(control.pitch_state.a);
-        cmd.target_yaw = angles::to_degrees(target_yaw);
-        cmd.target_pitch = angles::to_degrees(target_pitch);
+        cmd.yaw = control_yaw;
+        cmd.v_yaw = control.yaw_state.v;
+        cmd.a_yaw = control.yaw_state.a;
+        cmd.pitch = control_pitch;
+        cmd.v_pitch = control.pitch_state.v;
+        cmd.a_pitch = control.pitch_state.a;
+        cmd.target_yaw = target_yaw;
+        cmd.target_pitch = target_pitch;
         cmd.fly_time = last_fly_time_;
         cmd.appear = true;
         cmd.aim_point = aim_traj_.state_at(time_in_traj);
@@ -357,17 +357,17 @@ struct RuneAimer::Impl {
             return std::make_pair(std::abs(shooting_range_yaw), std::abs(shooting_range_pitch));
         };
         auto enable_diff = cal_enbale_diff(time_in_traj);
-        cmd.enable_yaw_diff = angles::to_degrees(enable_diff.first);
-        cmd.enable_pitch_diff = angles::to_degrees(enable_diff.second);
+        cmd.enable_yaw_diff = enable_diff.first;
+        cmd.enable_pitch_diff = enable_diff.second;
         auto abs_angle_error = [](double from, double to) {
             return std::abs(angles::shortest_angular_distance(from, to));
         };
         cmd.fire_advice =
-            abs_angle_error(angles::from_degrees(cmd.target_yaw), angles::from_degrees(cmd.yaw))
+            abs_angle_error(cmd.target_yaw, cmd.yaw)
                 < cmd.enable_yaw_diff
             && abs_angle_error(
-                   angles::from_degrees(cmd.target_pitch),
-                   angles::from_degrees(cmd.pitch)
+                   cmd.target_pitch,
+                   cmd.pitch
                ) < cmd.enable_pitch_diff;
         return cmd;
     }

@@ -36,6 +36,7 @@ struct SendRobotCmdData {
     float a_yaw, a_pitch;
 
     uint8_t detect_color;
+    uint8_t track_id; // 当前追踪目标编号
     auto to_tuple() const {
         return std::tie(
             cmd_ID,
@@ -51,7 +52,8 @@ struct SendRobotCmdData {
             v_pitch,
             a_yaw,
             a_pitch,
-            detect_color
+            detect_color,
+            track_id
         );
     }
 

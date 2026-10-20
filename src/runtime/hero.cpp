@@ -205,7 +205,6 @@ int main(int argc, char** argv) {
     BulletPickUp bullet_pick_up(config["bullet_pick_up"]);
     LogCtx log_ctx;
     std::optional<auto_aim::AutoAimDebugCtx> auto_aim_dbg;
-    std::pair<double, double> operator_offset = std::make_pair(0, 0);
     if (debug) {
         auto_aim_dbg.emplace();
         auto_aim_dbg->camera_info_ = camera_info;
@@ -284,19 +283,16 @@ int main(int argc, char** argv) {
                 }
                 auto packet_time = now - std::chrono::microseconds(delay);
                 ISO3 gimbal_2_gimbal_odom = ISO3::Identity();
-                gimbal_2_gimbal_odom.linear() = utils::rpy2matrix(Vec3(
-                    angles::from_degrees(robo.roll),
-                    angles::from_degrees(robo.pitch),
-                    angles::from_degrees(robo.yaw)
-                ));
+                gimbal_2_gimbal_odom.linear() = utils::rpy2matrix(Vec3(robo.roll, robo.pitch, robo.yaw));
                 tf->push(
                     SimpleFrame::GIMBAL_ODOM,
                     SimpleFrame::GIMBAL,
                     packet_time,
                     gimbal_2_gimbal_odom
                 );
-                operator_offset = { angles::from_degrees(robo.operator_yaw_offset),
-                                    angles::from_degrees(robo.operator_pitch_offset) };
+                if (robo.shutdown) {
+                    std::system("shutdown -h now");
+                }
                 ISO3 gimbal_odom_in_odom = ISO3::Identity();
                 gimbal_odom_in_odom.translation() = wheel_odometry.state.pos();
                 tf->push(
@@ -539,7 +535,7 @@ int main(int argc, char** argv) {
             {
                 //   auto_aim_fsm = auto_aim::AutoAimFsm::AIM_WHOLE_CAR_CENTER;
             }
-            very_aimer.set_operator_offset(operator_offset);
+            very_aimer.set_operator_offset({ 0.0, 0.0 });
             cmd = very_aimer.very_aim(target, bullet_speed, auto_aim_fsm);
         }
 
@@ -555,7 +551,10 @@ int main(int argc, char** argv) {
             send.v_pitch = cmd.v_pitch, send.a_yaw = cmd.a_yaw, send.a_pitch = cmd.a_pitch;
             send.enable_yaw_diff = cmd.enable_yaw_diff;
             send.enable_pitch_diff = cmd.enable_pitch_diff;
-            serial->write(std::move(utils::to_vector(send)));
+            send.track_id = static_cast<uint8_t>(target.target_number);
+            if (utils::is_finite(send)) {
+                serial->write(std::move(utils::to_vector(send)));
+            }
         }
         auto old_in_camera_cv = tf->pose_a_in_b(
             SimpleFrame(cmd.aim_point.frame_id),
@@ -599,7 +598,7 @@ int main(int argc, char** argv) {
                 tf->pose_a_in_b(SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, Clock::now());
             auto rpy = utils::matrix2rpy<double>(gimbal_in_gimbal_odom.linear());
             auto gimbal_yaw_pitch =
-                std::make_pair(angles::to_degrees(rpy[2]), -angles::to_degrees(rpy[1]));
+                std::make_pair(rpy[2], -rpy[1]);
             auto_aim_dbg->gimbal_yaw_pitch.set(gimbal_yaw_pitch);
             write_debug_data(auto_aim_dbg.value());
             bullet_pick_up.update(

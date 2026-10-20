@@ -192,9 +192,9 @@ int main(int argc, char** argv) {
                     now - std::chrono::microseconds(serial_send_to_image_microseconds);
                 ISO3 gimbal_2_gimbal_odom = ISO3::Identity();
                 gimbal_2_gimbal_odom.linear() = utils::rpy2matrix(Vec3(
-                    angles::from_degrees(robo.roll),
-                    angles::from_degrees(robo.pitch),
-                    angles::from_degrees(robo.yaw)
+                    robo.roll,
+                    robo.pitch,
+                    robo.yaw
                 ));
                 tf->push(
                     SimpleFrame::GIMBAL_ODOM,

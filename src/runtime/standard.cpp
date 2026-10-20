@@ -236,7 +236,6 @@ int main(int argc, char** argv) {
     BulletPickUp bullet_pick_up(config["bullet_pick_up"]);
     LogCtx log_ctx;
     std::optional<VisionDebugCtx> dbg;
-    std::pair<double, double> operator_offset = std::make_pair(0, 0);
     if (debug) {
         dbg.emplace();
         dbg->camera_info_ = camera_info;
@@ -380,11 +379,7 @@ int main(int argc, char** argv) {
                     now - std::chrono::microseconds(serial_send_to_image_microseconds);
                 ISO3 gimbal_in_gimbal_odom = ISO3::Identity();
                 gimbal_in_gimbal_odom.linear() = utils::rpy2matrix(
-                    Vec3(
-                        angles::from_degrees(robo.roll),
-                        angles::from_degrees(robo.pitch),
-                        angles::from_degrees(robo.yaw)
-                    ),
+                    Vec3(robo.roll, robo.pitch, robo.yaw),
                     utils::RPYOrder::ZYX
                 );
                 tf->push(
@@ -393,8 +388,9 @@ int main(int argc, char** argv) {
                     packet_time,
                     gimbal_in_gimbal_odom
                 );
-                operator_offset = { angles::from_degrees(robo.operator_yaw_offset),
-                                    angles::from_degrees(robo.operator_pitch_offset) };
+                if (robo.shutdown) {
+                    std::system("shutdown -h now");
+                }
                 auto gimbal_odom_in_odom = ISO3::Identity();
                 gimbal_odom_in_odom.translation() = Vec3(robo.v_x, robo.v_y, robo.v_z);
                 // tf->push(
@@ -685,7 +681,6 @@ int main(int argc, char** argv) {
             tf->pose_a_in_b(SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, Clock::now());
         static ShootControlSend shoot_send;
         if (a_target.check()) {
-            very_aimer.set_operator_offset(operator_offset);
             cmd = very_aimer.very_aim(
                 a_target,
                 bullet_speed,
@@ -695,7 +690,6 @@ int main(int argc, char** argv) {
             );
 
         } else if (r_target.check()) {
-            rune_aimer.set_operator_offset(operator_offset);
             cmd =
                 rune_aimer.aim(r_target, bullet_speed, shoot_in_gimbal_odom, gimbal_in_gimbal_odom);
             bool can_fire = rune_aimer.tick_fire(r_target, cmd);
@@ -720,12 +714,16 @@ int main(int argc, char** argv) {
             send.v_pitch = cmd.v_pitch, send.a_yaw = cmd.a_yaw, send.a_pitch = cmd.a_pitch;
             send.enable_yaw_diff = cmd.enable_yaw_diff;
             send.enable_pitch_diff = cmd.enable_pitch_diff;
+            send.track_id = static_cast<uint8_t>(a_target.target_number);
+            Web::write_log("send_cmd", [&](auto& j) {
+                j["appear"] = Web::val((int)send.appear);
+            });
             if (utils::is_finite(send)) {
                 serial->write(std::move(utils::to_vector(send)));
             }
-            if (utils::is_finite(shoot_send)) {
-                serial->write(std::move(utils::to_vector(shoot_send)));
-            }
+            // if (utils::is_finite(shoot_send)) {
+            //     serial->write(std::move(utils::to_vector(shoot_send)));
+            // }
         }
 #ifdef USE_Daedalus
         if (daedalus_shm_client) {
@@ -735,12 +733,12 @@ int main(int argc, char** argv) {
                 utils::matrix2rpy<double>(gimbal_in_gimbal_odom.linear(), utils::RPYOrder::ZYX);
             static TimePoint last_fire;
             bool fire = cmd.fire_advice
-                && (std::abs(angles::shortest_angular_distance_degrees(
-                        angles::to_degrees(rpy[2]),
+                && (std::abs(angles::shortest_angular_distance(
+                        rpy[2],
                         cmd.target_yaw
                     )) < cmd.enable_yaw_diff
-                    && std::abs(angles::shortest_angular_distance_degrees(
-                           angles::to_degrees(-rpy[1]),
+                    && std::abs(angles::shortest_angular_distance(
+                           -rpy[1],
                            cmd.target_pitch
                        ))
                         < cmd.enable_pitch_diff);
@@ -804,7 +802,7 @@ int main(int argc, char** argv) {
                 auto rpy =
                     utils::matrix2rpy<double>(gimbal_in_gimbal_odom.linear(), utils::RPYOrder::ZYX);
                 auto gimbal_yaw_pitch =
-                    std::make_pair(angles::to_degrees(rpy[2]), -angles::to_degrees(rpy[1]));
+                    std::make_pair(rpy[2], -rpy[1]);
                 dbg->gimbal_yaw_pitch.set(gimbal_yaw_pitch);
                 bullet_pick_up.update(
                     Clock::now(),

@@ -25,17 +25,14 @@ struct ReceiveRobotData {
     uint32_t time_stamp_send_micro; //发送此包时STM32的时间戳
 
     float yaw, pitch,
-        roll; //坐标系定义： +x:前，+y:左，+z：上，+yaw 左，+pitch 下。+roll 右倾，旋转顺序ZYX
-    // float q[4]; // wxyz
-    float vyaw, vpitch, vroll;
+        roll; //坐标系定义： +x:前，+y:左，+z：上，+yaw 左，+pitch 下。+roll 右倾，旋转顺序ZYX (rad)
+    float yaw_vel, pitch_vel, roll_vel;
     float v_x, v_y, v_z;
 
     float bullet_speed;
     uint8_t detect_color; //0 r 1 b
+    uint8_t shutdown;     //1=触发关机
     uint32_t bullet_count; //发出弹+1
-    float operator_yaw_offset;
-    float operator_pitch_offset;
-    // uint8_t mode;
 
     static std::optional<ReceiveRobotData> create(const std::vector<uint8_t>& data) {
         if (data.size() != sizeof(ReceiveRobotData) || data[0] != ID)
@@ -65,9 +62,8 @@ struct ReceiveRobotData {
 
             j["bullet_speed"] = Web::val(bullet_speed);
             j["detect_color"] = (detect_color == 0 ? "Red" : "Blue");
+            j["shutdown"] = Web::val(shutdown);
             j["bullet_count"] = Web::val(bullet_count);
-            j["operator_yaw_offset"] = Web::val(operator_yaw_offset);
-            j["operator_pitch_offset"] = Web::val(operator_pitch_offset);
             // j["mode"] = Web::val(mode);
         });
     }
