@@ -16,16 +16,15 @@ public:
             device_name_ = config["device_name"].as<std::string>();
 
             fps_ = config["fps"].as<int>();
-
             width_ = config["width"].as<int>();
-
             height_ = config["height"].as<int>();
-
-            exposure_ = config["exposure"].as<double>();
-
-            gain_ = config["gain"].as<double>();
-
-            gamma_ = config["gamma"].as<double>();
+            gamma_       = config["gamma"].as<double>();
+            brightness_  = config["brightness"].as<int>();
+            contrast_    = config["contrast"].as<int>();
+            saturation_  = config["saturation"].as<int>();
+            sharpness_   = config["sharpness"].as<int>();
+            auto_wb_     = config["auto_white_balance"].as<bool>();
+            wb_temp_     = config["white_balance_temperature"].as<int>();
 
         } catch (const std::exception& e) {
             AWAKENING_ERROR("Failed to load config: {}", e.what());
@@ -93,9 +92,15 @@ public:
 
         set_and_check(cap_, cv::CAP_PROP_FRAME_WIDTH, width_, "WIDTH");
         set_and_check(cap_, cv::CAP_PROP_FRAME_HEIGHT, height_, "HEIGHT");
-        set_and_check(cap_, cv::CAP_PROP_EXPOSURE, exposure_, "EXPOSURE");
-        set_and_check(cap_, cv::CAP_PROP_GAIN, gain_, "GAIN");
         set_and_check(cap_, cv::CAP_PROP_GAMMA, gamma_, "GAMMA");
+        set_and_check(cap_, cv::CAP_PROP_BRIGHTNESS, brightness_, "BRIGHTNESS");
+        set_and_check(cap_, cv::CAP_PROP_CONTRAST, contrast_, "CONTRAST");
+        set_and_check(cap_, cv::CAP_PROP_SATURATION, saturation_, "SATURATION");
+        set_and_check(cap_, cv::CAP_PROP_SHARPNESS, sharpness_, "SHARPNESS");
+        set_and_check(cap_, cv::CAP_PROP_AUTO_WB, auto_wb_ ? 1.0 : 0.0, "AUTO_WB");
+        if (!auto_wb_) {
+            set_and_check(cap_, cv::CAP_PROP_WB_TEMPERATURE, wb_temp_, "WB_TEMPERATURE");
+        }
         set_and_check(cap_, cv::CAP_PROP_FPS, fps_, "FPS");
         running_ = true;
     }
@@ -135,22 +140,19 @@ public:
 
         AWAKENING_INFO("Camera reopened successfully.");
     }
-    double get_ExposureTime() const override {
-        return exposure_;
-    }
-    void set_ExposureTime(double exposure_time) override {
-        exposure_ = exposure_time;
-        if (cap_.isOpened()) {
-            set_and_check(cap_, cv::CAP_PROP_EXPOSURE, exposure_, "EXPOSURE");
-        }
-    }
+    double get_ExposureTime() const override { return 0.0; }
+    void set_ExposureTime(double) override {}
     std::string device_name_;
     int fps_;
     int width_;
     int height_;
-    double exposure_;
-    double gain_;
     double gamma_;
+    int brightness_;
+    int contrast_;
+    int saturation_;
+    int sharpness_;
+    bool auto_wb_;
+    int wb_temp_;
     YAML::Node config_;
     bool running_ = false;
     cv::VideoCapture cap_;
