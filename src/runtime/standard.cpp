@@ -241,6 +241,10 @@ int main(int argc, char** argv) {
         dbg->camera_info_ = camera_info;
     }
     WheelOdometry wheel_odometry(config["wheel_odometry"], Clock::now());
+    // Daedalus pose callbacks and the solver run on different scheduler threads.  The
+    // sim adapter below is the only writer; guard the shared WheelOdometry snapshot so
+    // the solver and debug logger never observe a torn position/timestamp.
+    std::mutex wheel_odometry_mutex;
     auto tf = SimpleRobotTF::create();
     {
         for (auto [from, to]: std::array {
@@ -282,6 +286,22 @@ int main(int argc, char** argv) {
                     Quaternion { pose->qw, pose->qx, pose->qy, pose->qz }.toRotationMatrix();
 
                 tf->push(parent, child, TimePoint(std::chrono::nanoseconds(pose->timestamp_ns)), T);
+                if (idx == talos::ipc::PoseIndex::POSE_ODOM) {
+                    // The simulation path has no chassis/wheel observation update, so
+                    // WheelOdometry otherwise stays at the origin.  The solver subtracts
+                    // this position from target_pos before handing the target to the
+                    // Aimer, while shoot_in_gimbal_odom is gimbal-relative.  Keeping the
+                    // two frames consistent is required for a correct target bearing.
+                    std::lock_guard<std::mutex> lock(wheel_odometry_mutex);
+                    wheel_odometry.state.x[wheel_motion_model::idx::X] = pose->x;
+                    wheel_odometry.state.x[wheel_motion_model::idx::Y] = pose->y;
+                    wheel_odometry.state.x[wheel_motion_model::idx::Z] = pose->z;
+                    wheel_odometry.state.x[wheel_motion_model::idx::VX] = 0.0;
+                    wheel_odometry.state.x[wheel_motion_model::idx::VY] = 0.0;
+                    wheel_odometry.state.x[wheel_motion_model::idx::VZ] = 0.0;
+                    wheel_odometry.state.timestamp =
+                        TimePoint(std::chrono::nanoseconds(pose->timestamp_ns));
+                }
             }
         };
 
@@ -654,7 +674,11 @@ int main(int argc, char** argv) {
         log_ctx.solve_count++;
         auto a_target = armor_target.read(); //需要转为相对gimbal_odom
         int old_this_id = a_target.this_id;
-        auto gimbal_odom_state_in_odom = wheel_odometry.state;
+        wheel_motion_model::State gimbal_odom_state_in_odom;
+        {
+            std::lock_guard<std::mutex> lock(wheel_odometry_mutex);
+            gimbal_odom_state_in_odom = wheel_odometry.state;
+        }
         gimbal_odom_state_in_odom.predict(Clock::now());
         a_target.set_target_state([&](auto& s) {
             namespace idx = auto_aim::armor_point_motion_model::idx;
@@ -748,10 +772,11 @@ int main(int argc, char** argv) {
             const double out_yaw = std::isfinite(cmd.yaw) ? cmd.yaw : cmd.target_yaw;
             const double out_pitch = std::isfinite(cmd.pitch) ? cmd.pitch : -cmd.target_pitch;
             // very_aimer works in radians; the Talos GimbalCmd interface is in degrees.
-            // AWAKENING's Gimbal frame is yawed +90 deg relative to the Talos gimbal
-            // frame (Daedalus includes Rz(pi/2) in its gimbal pose).
+            // The Aimer already publishes the gimbal yaw in the GIMBAL_ODOM frame;
+            // adding an empirical +90 here rotates the target away from the armor.
+            const double sent_yaw = angles::normalize_degrees(angles::to_degrees(out_yaw));
             daedalus_shm_client->send_gimbal_cmd(
-                angles::normalize_degrees(angles::to_degrees(out_yaw) + 90.0),
+                sent_yaw,
                 -angles::to_degrees(out_pitch),
                 cmd.appear ? 1.0 : -1.0,
                 send_fire
@@ -795,7 +820,10 @@ int main(int argc, char** argv) {
                 auto __rune_target = rune_target.read();
                 __armor_target.write_log();
                 __rune_target.write_log();
-                wheel_odometry.write_log();
+                {
+                    std::lock_guard<std::mutex> lock(wheel_odometry_mutex);
+                    wheel_odometry.write_log();
+                }
                 auto img_now = dbg->img_frame.get().timestamp;
                 dbg->armor_target.set(__armor_target);
                 dbg->rune_target.set(__rune_target);
