@@ -285,7 +285,9 @@ int main(int argc, char** argv) {
             }
         };
 
-        s.add_rate_source<>("daedalus_tick", 300.0, [&]() {
+        // Capture the source handle and helper closure by value: both are locals of the
+        // conditional block, while the scheduler invokes this callback after that block ends.
+        s.add_rate_source<>("daedalus_tick", 300.0, [&, daedalus_imgs, push_pose]() {
             static bool has_camera_info = false;
 
             if (!has_camera_info) {
@@ -305,8 +307,11 @@ int main(int argc, char** argv) {
             }
 
             if (auto frame = daedalus_shm_client->recv_image()) {
+                // Talos images are zero-copy views into a 3-slot shared-memory pool. The
+                // scheduler/detector is asynchronous, so a later producer frame can overwrite
+                // the slot while it is still being processed. Copy once at the boundary.
                 ImageFrame img_frame {
-                    .src_img = std::move(frame->image),
+                    .src_img = frame->image.clone(),
                     .format = PixelFormat::RGB,
                     .timestamp = TimePoint(std::chrono::nanoseconds(frame->timestamp_ns)),
                 };
@@ -329,6 +334,14 @@ int main(int argc, char** argv) {
                 talos::ipc::PoseIndex::POSE_GIMBAL,
                 SimpleFrame::GIMBAL_ODOM,
                 SimpleFrame::GIMBAL
+            );
+            // Daedalus publishes POSE_ODOM as (gimbal position in odom, identity rotation).
+            // Consume it to (a) satisfy the image/pose synchronization handshake and
+            // (b) bind ODOM -> GIMBAL_ODOM with the correct world translation.
+            push_pose(
+                talos::ipc::PoseIndex::POSE_ODOM,
+                SimpleFrame::ODOM,
+                SimpleFrame::GIMBAL_ODOM
             );
         });
     }
@@ -727,32 +740,22 @@ int main(int argc, char** argv) {
         }
 #ifdef USE_Daedalus
         if (daedalus_shm_client) {
-            auto gimbal_in_gimbal_odom =
-                tf->pose_a_in_b(SimpleFrame::GIMBAL, SimpleFrame::GIMBAL_ODOM, Clock::now());
-            auto rpy =
-                utils::matrix2rpy<double>(gimbal_in_gimbal_odom.linear(), utils::RPYOrder::ZYX);
-            static TimePoint last_fire;
-            bool fire = cmd.fire_advice
-                && (std::abs(angles::shortest_angular_distance(
-                        rpy[2],
-                        cmd.target_yaw
-                    )) < cmd.enable_yaw_diff
-                    && std::abs(angles::shortest_angular_distance(
-                           -rpy[1],
-                           cmd.target_pitch
-                       ))
-                        < cmd.enable_pitch_diff);
-            if (fire) {
-                last_fire = Clock::now();
-            }
-            bool send_fire = false;
-            if (Clock::now() - last_fire < std::chrono::milliseconds(100)) {
-                send_fire = true;
-            }
-            daedalus_shm_client
-                ->send_gimbal_cmd(cmd.yaw, -cmd.pitch, cmd.appear ? 1.0 : -1.0, send_fire);
-            // daedalus_shm_client
-            //     ->send_gimbal_cmd(cmd.yaw, -cmd.pitch, cmd.appear ? 1.0 : -1.0, false);
+            // Simulator safety: never forward a firing command to Daedalus.
+            constexpr bool send_fire = false;
+            // Team mpc can emit NaN control states in this cold-start sim. Fall back to
+            // its finite target trajectory at the adapter boundary; do not alter the
+            // team Aimer implementation or its mpc configuration.
+            const double out_yaw = std::isfinite(cmd.yaw) ? cmd.yaw : cmd.target_yaw;
+            const double out_pitch = std::isfinite(cmd.pitch) ? cmd.pitch : -cmd.target_pitch;
+            // very_aimer works in radians; the Talos GimbalCmd interface is in degrees.
+            // AWAKENING's Gimbal frame is yawed +90 deg relative to the Talos gimbal
+            // frame (Daedalus includes Rz(pi/2) in its gimbal pose).
+            daedalus_shm_client->send_gimbal_cmd(
+                angles::normalize_degrees(angles::to_degrees(out_yaw) + 90.0),
+                -angles::to_degrees(out_pitch),
+                cmd.appear ? 1.0 : -1.0,
+                send_fire
+            );
         }
 #endif
         auto old_in_camera_cv = tf->pose_a_in_b(

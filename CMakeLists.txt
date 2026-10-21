@@ -128,8 +128,6 @@ add_library(${PROJECT_NAME}_utils SHARED ${UTILS_SOURCES})
 awakening_enable_pch(${PROJECT_NAME}_utils)
 target_compile_definitions(${PROJECT_NAME}_utils PUBLIC ${BUILD_DEFINITIONS})
 target_link_libraries(${PROJECT_NAME}_utils
-    HikSDK::HikSDK
-    MvSDK::MvSDK
     yaml-cpp
     fmt::fmt
     Eigen3::Eigen
