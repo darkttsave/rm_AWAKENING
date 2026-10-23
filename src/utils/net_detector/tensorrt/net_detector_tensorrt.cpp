@@ -26,11 +26,15 @@ namespace awakening::utils {
 struct NetDetectorTensorrt::Impl {
     struct Params {
         std::string model_path;
+        std::string engine_path;
         int copy_context_num = 1;
         double min_free_mem_ratio = 0.1;
         bool use_cuda_preproces = true;
         void load(const YAML::Node& config) {
             model_path = replace_root_dir(config["model_path"].as<std::string>());
+            if (config["engine_path"]) {
+                engine_path = replace_root_dir(config["engine_path"].as<std::string>());
+            }
             copy_context_num = config["copy_context_num"].as<int>();
             min_free_mem_ratio = config["min_free_mem_ratio"].as<double>();
             use_cuda_preproces = config["use_cuda_preproces"].as<bool>();
@@ -59,7 +63,7 @@ struct NetDetectorTensorrt::Impl {
         config_ = c;
 
         params_.load(config);
-        buildEngine(params_.model_path);
+        buildEngine(params_.model_path, params_.engine_path);
         auto tmp_ctx =
             std::unique_ptr<nvinfer1::IExecutionContext>(engine_->createExecutionContext());
 
@@ -114,9 +118,13 @@ struct NetDetectorTensorrt::Impl {
             ctx_buffers_.add_resource(std::move(ctx));
         }
     }
-    void buildEngine(const std::string& onnx_path) {
-        const std::string engine_path =
-            onnx_path.substr(0, onnx_path.find_last_of('.')) + ".engine";
+    void buildEngine(const std::string& onnx_path, const std::string& configured_engine_path) {
+        // Keep the historical ONNX-derived name when engine_path is omitted, but
+        // allow a per-model engine name so models such as 1208 do not collide with
+        // legacy engines checked into the repository.
+        const std::string engine_path = configured_engine_path.empty()
+            ? onnx_path.substr(0, onnx_path.find_last_of('.')) + ".engine"
+            : configured_engine_path;
 
         runtime_.reset(nvinfer1::createInferRuntime(g_logger_));
 

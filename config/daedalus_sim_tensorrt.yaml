@@ -47,7 +47,7 @@ armor_detector:
   backend: tensorrt
   net_detector:
     openvino:
-      model_path: ${ROOT_DIR}/model/0708.onnx
+      model_path: ${ROOT_DIR}/model/opt-1208-001.onnx
       device_name: "CPU"
       perf_mode: "THROUGHPUT"
       priority: "HIGH"
@@ -55,12 +55,13 @@ armor_detector:
       execution_mode: "PERFORMANCE"
       infer_request_buffer_num: 10
     tensorrt:
-      model_path: ${ROOT_DIR}/model/0708_sm120.onnx
+      model_path: ${ROOT_DIR}/model/opt-1208-001.onnx
+      engine_path: ${ROOT_DIR}/model/opt-1208-001_sm120.engine
       copy_context_num: 4
       min_free_mem_ratio: 0.1
       use_cuda_preproces: true
     armor_infer:
-      model_type: rp
+      model_type: tup
       conf_threshold: 0.2
   number_classifier:
     enable: true
