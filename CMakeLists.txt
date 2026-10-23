@@ -89,19 +89,34 @@ if(BUILD_WITH_OPENVINO)
 endif()
 
 if(BUILD_WITH_TRT)
+    # TensorRT is installed outside this repository.  Prefer an explicit
+    # TENSORRT_ROOT so the same checkout works on different machines instead of
+    # hard-coding another user's /home/<name>/TensorRT-* path.
+    if(DEFINED ENV{TENSORRT_ROOT} AND NOT "$ENV{TENSORRT_ROOT}" STREQUAL "")
+        list(PREPEND CMAKE_PREFIX_PATH "$ENV{TENSORRT_ROOT}")
+        set(TensorRT_ROOT "$ENV{TENSORRT_ROOT}" CACHE PATH "TensorRT SDK root")
+    endif()
     find_package(CUDAToolkit REQUIRED)
-    set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};/home/hy/TensorRT-10.6.0.26")
     find_package(TensorRT REQUIRED)
-    include_directories(${TensorRT_INCLUDE_DIR})
-    include_directories(/usr/local/cuda/include)
-    set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
-    set(CMAKE_CUDA_ARCHITECTURES 86)
+    include_directories(${TensorRT_INCLUDE_DIR} ${TensorRT_INCLUDE_DIRS})
+    include_directories(${CUDAToolkit_INCLUDE_DIRS})
+    if(NOT CMAKE_CUDA_COMPILER)
+        set(CMAKE_CUDA_COMPILER "${CUDAToolkit_BIN_DIR}/nvcc")
+    endif()
+    # RTX 50-series is sm_120; native lets the installed CUDA toolkit select it.
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES native)
+    endif()
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
     list(APPEND BUILD_DEFINITIONS USE_TRT)
-    list(APPEND BUILD_LIBS TensorRT::TensorRT TensorRT::nvonnxparser CUDA::cudart  /usr/local/cuda/lib64/libnppicc.so)
+    if(TARGET CUDA::nppicc)
+        list(APPEND BUILD_LIBS TensorRT::TensorRT TensorRT::nvonnxparser CUDA::cudart CUDA::nppicc)
+    else()
+        list(APPEND BUILD_LIBS TensorRT::TensorRT TensorRT::nvonnxparser CUDA::cudart "${CUDAToolkit_LIBRARY_DIR}/libnppicc.so")
+    endif()
 endif()
 
 configure_file(

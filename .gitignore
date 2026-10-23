@@ -1,4 +1,5 @@
 build
+build-trt/
 
 devel
 
@@ -31,5 +32,6 @@ bin
 
 model/at.onnx
 model/at.engine
+model/0708_sm120.engine
 Camera
 output
