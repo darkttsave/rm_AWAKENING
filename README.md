@@ -157,6 +157,26 @@ cmake --build build-trt -j2
 sudo ./bin/standard omni true
 ```
 
+常用 Daedalus 配置入口：
+
+| 运行任务 | 配置文件 | 模型与解析器 |
+|---|---|---|
+| 自瞄 / OpenVINO | `config/daedalus_sim_openvino.yaml` | 装甲 TUP；能量机关 CB9 `cb_rune.onnx + model_type: cb` |
+| 自瞄 / TensorRT | `config/daedalus_sim_tensorrt.yaml` | 装甲 TensorRT；能量机关仍为 CB9 OpenVINO |
+| 能量机关 CB5 / OpenVINO | `config/daedalus_sim_openvino_cb5.yaml` | `model-0624.onnx + model_type: cb5`，双路 LATENCY、单 stream 基线 |
+
+CB5 OpenVINO 仿真启动示例：
+
+```bash
+LD_LIBRARY_PATH=/opt/ros/jazzy/lib \
+  ./bin/standard config/daedalus_sim_openvino_cb5.yaml false
+```
+
+线程数、stream、CPU pinning 和核心类型属于目标硬件相关参数，调整前请保留基线并重新测试；CB5 TensorRT 适配尚未在该入口中实现。
+
+CB5 OpenVINO 参数位置、验证指标和恢复方法见
+[`reminder/reminder_CB5_OpenVINO调参.md`](reminder/reminder_CB5_OpenVINO调参.md)。
+
 ---
 
 ## 🌐 启动远程 Web 可视化

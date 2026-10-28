@@ -18,10 +18,12 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <opencv2/highgui.hpp>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 #ifdef USE_RERUN
     #include "_rerun/recorder.hpp"
     #include "_rerun/tf.hpp"
@@ -96,9 +98,16 @@ struct FrameTag {};
 using CameraIO = IOPair<CameraTag, ImageFrame>;
 using SerialIO = IOPair<SerialTag, std::vector<uint8_t>>;
 using CommonFrameIo = IOPair<FrameTag, CommonFrame>;
+struct TimedRuneDetection {
+    auto_buff::RuneDetection detection;
+    int id = -1;
+    bool detected = false;
+    TimePoint detector_start {};
+    TimePoint detector_end {};
+};
 struct Detection {
     std::optional<std::vector<auto_aim::Armors>> armors;
-    std::optional<std::vector<auto_buff::RuneDetection>> rune;
+    std::optional<std::vector<TimedRuneDetection>> rune;
     std::optional<TimePoint> detect_start;
 };
 using DetIo = IOPair<DetectTag, Detection>;
@@ -114,6 +123,51 @@ struct LogCtx {
         *this = {};
     }
 };
+struct Cb5PerfSample {
+    bool detected = false;
+    double preprocess_ms = 0.0;
+    double inference_ms = 0.0;
+    double output_copy_ms = 0.0;
+    double postprocess_ms = 0.0;
+    double traditional_cv_ms = 0.0;
+    double detector_ms = 0.0;
+    double queue_wait_ms = 0.0;
+    double tracker_ms = 0.0;
+    double total_ms = 0.0;
+};
+struct Cb5PerfCtx {
+    void add(Cb5PerfSample sample) {
+        std::lock_guard<std::mutex> lock(mutex);
+        samples.push_back(sample);
+    }
+    std::vector<Cb5PerfSample> take() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<Cb5PerfSample> result;
+        result.swap(samples);
+        return result;
+    }
+    std::mutex mutex;
+    std::vector<Cb5PerfSample> samples;
+};
+
+template<typename Member>
+std::pair<double, double>
+avg_p95(const std::vector<Cb5PerfSample>& samples, Member member, bool detected_only = true) {
+    std::vector<double> values;
+    values.reserve(samples.size());
+    for (const auto& sample: samples) {
+        if (!detected_only || sample.detected) {
+            values.push_back(sample.*member);
+        }
+    }
+    if (values.empty()) {
+        return { 0.0, 0.0 };
+    }
+    const double sum = std::accumulate(values.begin(), values.end(), 0.0);
+    std::sort(values.begin(), values.end());
+    const size_t p95_index = static_cast<size_t>(0.95 * static_cast<double>(values.size() - 1));
+    return { sum / static_cast<double>(values.size()), values[p95_index] };
+}
 struct AutoExposureCfg {
     double target_brightness = 0.0;
     double step_gain = 0.0;
@@ -230,11 +284,12 @@ int main(int argc, char** argv) {
     auto_buff::RuneTracker rune_tracker(config["rune_tracker"]);
     auto_buff::RuneAimer rune_aimer(config["rune_aimer"]);
     utils::OrderedQueue<auto_aim::Armors> armors_queue;
-    utils::OrderedQueue<auto_buff::RuneDetection> rune_detections_queue;
+    utils::OrderedQueue<TimedRuneDetection> rune_detections_queue;
     utils::SWMR<auto_aim::ArmorTarget> armor_target;
     utils::SWMR<auto_buff::RuneTarget> rune_target;
     BulletPickUp bullet_pick_up(config["bullet_pick_up"]);
     LogCtx log_ctx;
+    Cb5PerfCtx cb5_perf_ctx;
     std::optional<VisionDebugCtx> dbg;
     if (debug) {
         dbg.emplace();
@@ -563,21 +618,24 @@ int main(int argc, char** argv) {
                     armor_detector.get_net_wh_ratio()
                 );
             }
-            auto_buff::RuneDetection rune_detection;
+            TimedRuneDetection timed_rune;
+            timed_rune.detector_start = Clock::now();
             {
                 bool got = detector_sem->try_acquire();
                 utils::SemaphoreGuard guard(*detector_sem, got); //并发控制
                 if (got) {
-                    auto start = Clock::now();
-                    r.detect_start = start;
-                    rune_detection = rune_detector.detect(frame, net_focus, enemy_color);
+                    timed_rune.detected = true;
+                    r.detect_start = timed_rune.detector_start;
+                    timed_rune.detection = rune_detector.detect(frame, net_focus, enemy_color);
                     log_ctx.detect_count++;
                 }
             }
-            rune_detection.frame_id = frame.frame_id;
-            rune_detection.id = frame.id;
-            rune_detection.timestamp = frame.img_frame.timestamp;
-            rune_detections_queue.enqueue(rune_detection);
+            timed_rune.detector_end = Clock::now();
+            timed_rune.detection.frame_id = frame.frame_id;
+            timed_rune.detection.id = frame.id;
+            timed_rune.detection.timestamp = frame.img_frame.timestamp;
+            timed_rune.id = frame.id;
+            rune_detections_queue.enqueue(std::move(timed_rune));
             auto batch_runes = rune_detections_queue.dequeue_batch();
             r.rune = batch_runes;
         }
@@ -641,7 +699,9 @@ int main(int argc, char** argv) {
                 log_ctx.track_count++;
             }
         } else if (io.rune) {
-            for (auto& rune: io.rune.value()) {
+            for (auto& timed_rune: io.rune.value()) {
+                const auto tracker_start = Clock::now();
+                auto& rune = timed_rune.detection;
                 auto camera_cv_in_odom = tf->pose_a_in_b(
                     SimpleFrame(rune.frame_id),
                     SimpleFrame::ODOM,
@@ -653,6 +713,31 @@ int main(int argc, char** argv) {
                     rune_tracker.track(rune, camera_info, camera_cv_in_odom, rune.frame_id);
 
                 rune_target.write(__rune_target);
+                const auto tracker_end = Clock::now();
+                const auto& timing = rune.timing;
+                cb5_perf_ctx.add(Cb5PerfSample {
+                    .detected = timed_rune.detected,
+                    .preprocess_ms = timing.preprocess_ms,
+                    .inference_ms = timing.inference_ms,
+                    .output_copy_ms = timing.output_copy_ms,
+                    .postprocess_ms = timing.postprocess_ms,
+                    .traditional_cv_ms = timing.traditional_cv_ms,
+                    .detector_ms = timing.detector_ms,
+                    .queue_wait_ms = std::chrono::duration<double, std::milli>(
+                                         tracker_start - timed_rune.detector_end
+                    )
+                                         .count(),
+                    .tracker_ms = std::chrono::duration<double, std::milli>(
+                                      tracker_end - tracker_start
+                    )
+                                      .count(),
+                    .total_ms = timed_rune.detected
+                        ? std::chrono::duration<double, std::milli>(
+                              tracker_end - timed_rune.detector_start
+                          )
+                              .count()
+                        : 0.0,
+                });
                 if (io.detect_start) {
                     auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           Clock::now() - io.detect_start.value()
@@ -807,6 +892,56 @@ int main(int argc, char** argv) {
         );
         if (dbg) {
             dbg->avg_latency_ms.set(avg_latency_ms);
+        }
+        if (mode == Mode::AutoBuff) {
+            const auto samples = cb5_perf_ctx.take();
+            if (!samples.empty()) {
+                const auto detected = static_cast<int>(std::count_if(
+                    samples.begin(),
+                    samples.end(),
+                    [](const auto& sample) { return sample.detected; }
+                ));
+                const auto pre = avg_p95(samples, &Cb5PerfSample::preprocess_ms);
+                const auto infer = avg_p95(samples, &Cb5PerfSample::inference_ms);
+                const auto copy = avg_p95(samples, &Cb5PerfSample::output_copy_ms);
+                const auto post = avg_p95(samples, &Cb5PerfSample::postprocess_ms);
+                const auto cv = avg_p95(samples, &Cb5PerfSample::traditional_cv_ms);
+                const auto detector = avg_p95(samples, &Cb5PerfSample::detector_ms);
+                const auto queue = avg_p95(samples, &Cb5PerfSample::queue_wait_ms);
+                const auto tracker = avg_p95(samples, &Cb5PerfSample::tracker_ms, false);
+                const auto total = avg_p95(samples, &Cb5PerfSample::total_ms);
+                AWAKENING_INFO(
+                    "cb5_perf tracked: {} detected: {} skipped: {} "
+                    "pre avg/p95: {:.3f}/{:.3f} infer: {:.3f}/{:.3f} "
+                    "copy: {:.3f}/{:.3f} post: {:.3f}/{:.3f}",
+                    samples.size(),
+                    detected,
+                    static_cast<int>(samples.size()) - detected,
+                    pre.first,
+                    pre.second,
+                    infer.first,
+                    infer.second,
+                    copy.first,
+                    copy.second,
+                    post.first,
+                    post.second
+                );
+                AWAKENING_INFO(
+                    "cb5_perf cv avg/p95: {:.3f}/{:.3f} detector: {:.3f}/{:.3f} "
+                    "queue: {:.3f}/{:.3f} tracker_all: {:.3f}/{:.3f} "
+                    "total: {:.3f}/{:.3f}",
+                    cv.first,
+                    cv.second,
+                    detector.first,
+                    detector.second,
+                    queue.first,
+                    queue.second,
+                    tracker.first,
+                    tracker.second,
+                    total.first,
+                    total.second
+                );
+            }
         }
         log_ctx.reset();
     });

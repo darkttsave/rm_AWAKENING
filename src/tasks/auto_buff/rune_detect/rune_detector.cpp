@@ -464,6 +464,7 @@ struct RuneDetector::Impl {
     RuneDetection
     detect(const CommonFrame& frame, const cv::Rect& focus, EnemyColor enemy_color) const noexcept {
         RuneDetection result;
+        const auto detector_start = Clock::now();
         // 所有 OpenCV/模型异常都必须在 noexcept 边界内被吞掉，否则 std::terminate。
         try {
             const cv::Mat& src = frame.img_frame.src_img;
@@ -478,8 +479,16 @@ struct RuneDetector::Impl {
             if (net_detector_ && rune_infer_) {
                 utils::NetDetectorBase::OutPut net_output;
                 net_output = net_detector_->detect(roi, frame.img_frame.format);
+                result.timing.preprocess_ms = net_output.preprocess_ms;
+                result.timing.inference_ms = net_output.inference_ms;
+                result.timing.output_copy_ms = net_output.output_copy_ms;
                 if (!net_output.output.empty()) {
+                    const auto postprocess_start = Clock::now();
                     result.fan_blades = rune_infer_->process(net_output.output);
+                    result.timing.postprocess_ms = std::chrono::duration<double, std::milli>(
+                                                       Clock::now() - postprocess_start
+                    )
+                                                       .count();
                     for (auto& fan_blade: result.fan_blades) {
                         fan_blade.transform(net_output.transform_matrix);
                         fan_blade.add_offset(focus_rect.tl());
@@ -488,6 +497,7 @@ struct RuneDetector::Impl {
                     AWAKENING_WARN("rune detector: empty network output");
                 }
             }
+            const auto traditional_cv_start = Clock::now();
             CVCtx cv1;
             cv1.src = roi;
             cv1.bin = preprocess(roi, frame.img_frame.format, enemy_color);
@@ -521,6 +531,10 @@ struct RuneDetector::Impl {
                     get_color(cv1.src, fan_target.rr.boundingRect2f(), frame.img_frame.format);
                 fan_target.add_offset(focus_rect.tl());
             }
+            result.timing.traditional_cv_ms = std::chrono::duration<double, std::milli>(
+                                                  Clock::now() - traditional_cv_start
+            )
+                                                  .count();
         } catch (const cv::Exception& e) {
             AWAKENING_ERROR("rune detector OpenCV error: {}", e.what());
             result.fan_blades.clear();
@@ -531,6 +545,8 @@ struct RuneDetector::Impl {
             AWAKENING_ERROR("rune detector unknown error");
             result.fan_blades.clear();
         }
+        result.timing.detector_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - detector_start).count();
         return result;
     }
     utils::NetDetectorBase::Ptr net_detector_;

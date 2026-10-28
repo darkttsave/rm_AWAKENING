@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -209,6 +210,29 @@ struct BenchSummary {
     double avg_objects = 0.0;
 };
 
+struct StageSamples {
+    void add(const utils::NetDetectorBase::OutPut& output) {
+        std::lock_guard<std::mutex> lock(mutex);
+        preprocess.push_back(output.preprocess_ms);
+        inference.push_back(output.inference_ms);
+        output_copy.push_back(output.output_copy_ms);
+    }
+    std::mutex mutex;
+    std::vector<double> preprocess;
+    std::vector<double> inference;
+    std::vector<double> output_copy;
+};
+
+std::pair<double, double> summarize_stage(std::vector<double> values) {
+    if (values.empty()) {
+        return { 0.0, 0.0 };
+    }
+    std::sort(values.begin(), values.end());
+    const double sum = std::accumulate(values.begin(), values.end(), 0.0);
+    const size_t p95_index = static_cast<size_t>(0.95 * static_cast<double>(values.size() - 1));
+    return { sum / static_cast<double>(values.size()), values[p95_index] };
+}
+
 template<typename Fn>
 BenchSummary run_benchmark(Fn&& fn, int concurrency, int iterations, int warmup = 5) {
     std::vector<std::vector<double>> thread_latencies(static_cast<size_t>(concurrency));
@@ -319,6 +343,25 @@ int benchmark(
             iterations
         )
     );
+
+    StageSamples stage_samples;
+    (void)run_benchmark(
+        [&]() {
+            const auto output = net.detect(src, PixelFormat::BGR);
+            stage_samples.add(output);
+            return output.output.empty() ? size_t { 0 } : size_t { 1 };
+        },
+        concurrency,
+        iterations
+    );
+    const auto preprocess = summarize_stage(std::move(stage_samples.preprocess));
+    const auto inference = summarize_stage(std::move(stage_samples.inference));
+    const auto output_copy = summarize_stage(std::move(stage_samples.output_copy));
+    std::cout << std::fixed << std::setprecision(3)
+              << "openvino_stages preprocess_avg/p95_ms=" << preprocess.first << "/"
+              << preprocess.second << " inference_avg/p95_ms=" << inference.first << "/"
+              << inference.second << " output_copy_avg/p95_ms=" << output_copy.first << "/"
+              << output_copy.second << "\n";
 
     const auto sample_output = net.detect(src, PixelFormat::BGR);
     print_benchmark(

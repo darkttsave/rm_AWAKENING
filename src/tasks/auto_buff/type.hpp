@@ -331,6 +331,14 @@ struct RuneFanTarget {
 };
 
 struct RuneDetection {
+    struct Timing {
+        double preprocess_ms = 0.0;
+        double inference_ms = 0.0;
+        double output_copy_ms = 0.0;
+        double postprocess_ms = 0.0;
+        double traditional_cv_ms = 0.0;
+        double detector_ms = 0.0;
+    } timing;
     TimePoint timestamp;
     int id = -1;
     int frame_id = -1;

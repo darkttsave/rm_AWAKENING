@@ -5,7 +5,10 @@
     #include "utils/logger.hpp"
     #include "utils/net_detector/net_detector_base.hpp"
     #include "utils/utils.hpp"
+    #include <algorithm>
     #include <atomic>
+    #include <chrono>
+    #include <cstdint>
     #include <openvino/core/type/element_type.hpp>
     #include <openvino/runtime/properties.hpp>
     #include <optional>
@@ -17,6 +20,9 @@ struct NetDetectorOpenVINO::Impl {
         std::string model_path;
         std::string device_name;
         int infer_request_buffer_num = 10;
+        std::optional<int32_t> inference_num_threads;
+        std::optional<int32_t> num_streams;
+        std::optional<bool> enable_cpu_pinning;
         std::optional<ov::hint::PerformanceMode> perf_mode;
         std::optional<ov::hint::Priority> priority;
         std::optional<ov::hint::SchedulingCoreType> scheduling_core_type;
@@ -98,6 +104,21 @@ struct NetDetectorOpenVINO::Impl {
             if (config["execution_mode"]) {
                 execution_mode = execModeFromString(config["execution_mode"].as<std::string>());
             }
+            if (config["inference_num_threads"]) {
+                inference_num_threads = config["inference_num_threads"].as<int32_t>();
+                if (inference_num_threads.value() <= 0) {
+                    throw std::invalid_argument("inference_num_threads must be positive");
+                }
+            }
+            if (config["num_streams"]) {
+                num_streams = config["num_streams"].as<int32_t>();
+                if (num_streams.value() <= 0) {
+                    throw std::invalid_argument("num_streams must be positive");
+                }
+            }
+            if (config["enable_cpu_pinning"]) {
+                enable_cpu_pinning = config["enable_cpu_pinning"].as<bool>();
+            }
             // if (config["distribution_policy"]) {
             //     distribution_policy =
             //         modelDistFromString(config["distribution_policy"].as<std::string>());
@@ -131,6 +152,15 @@ struct NetDetectorOpenVINO::Impl {
                 if (device_name.find("CPU") != std::string::npos) {
                     m.emplace(ov::hint::scheduling_core_type(scheduling_core_type.value()));
                 }
+            }
+            if (inference_num_threads.has_value()) {
+                m.emplace(ov::inference_num_threads(inference_num_threads.value()));
+            }
+            if (num_streams.has_value()) {
+                m.emplace(ov::num_streams(ov::streams::Num(num_streams.value())));
+            }
+            if (enable_cpu_pinning.has_value()) {
+                m.emplace(ov::hint::enable_cpu_pinning(enable_cpu_pinning.value()));
             }
 
             return m;
@@ -186,11 +216,51 @@ struct NetDetectorOpenVINO::Impl {
         compiled_model_ = std::make_unique<ov::CompiledModel>(
             ov_core_->compile_model(model_, params_.device_name, any_map)
         );
+        log_effective_properties();
         for (int i = 0; i < params_.infer_request_buffer_num; ++i) {
             infer_request_buffer_.add_resource(create_infer_request());
         }
         AWAKENING_INFO("OpenVINO model : {} compiled successfully!", params_.model_path);
         resetting_ = false;
+    }
+    void log_effective_properties() const {
+        const auto supported = compiled_model_->get_property(ov::supported_properties);
+        const auto supports = [&](const std::string& property_name) {
+            return std::find(supported.begin(), supported.end(), property_name) != supported.end();
+        };
+        if (supports(ov::inference_num_threads.name())) {
+            AWAKENING_INFO(
+                "OpenVINO effective inference_num_threads: {}",
+                compiled_model_->get_property(ov::inference_num_threads)
+            );
+        }
+        if (supports(ov::num_streams.name())) {
+            const auto streams = compiled_model_->get_property(ov::num_streams);
+            AWAKENING_INFO("OpenVINO effective num_streams: {}", streams.num);
+        }
+        if (supports(ov::hint::enable_cpu_pinning.name())) {
+            AWAKENING_INFO(
+                "OpenVINO effective enable_cpu_pinning: {}",
+                compiled_model_->get_property(ov::hint::enable_cpu_pinning)
+            );
+        }
+        if (supports(ov::hint::scheduling_core_type.name())) {
+            const auto core_type =
+                compiled_model_->get_property(ov::hint::scheduling_core_type);
+            const char* name = "UNKNOWN";
+            switch (core_type) {
+                case ov::hint::SchedulingCoreType::ANY_CORE:
+                    name = "ANY_CORE";
+                    break;
+                case ov::hint::SchedulingCoreType::PCORE_ONLY:
+                    name = "PCORE_ONLY";
+                    break;
+                case ov::hint::SchedulingCoreType::ECORE_ONLY:
+                    name = "ECORE_ONLY";
+                    break;
+            }
+            AWAKENING_INFO("OpenVINO effective scheduling_core_type: {}", name);
+        }
     }
     ov::InferRequest create_infer_request() noexcept {
         return compiled_model_->create_infer_request();
@@ -224,6 +294,7 @@ struct NetDetectorOpenVINO::Impl {
             init();
         }
         OutPut output;
+        const auto preprocess_start = std::chrono::steady_clock::now();
         output.resized_img =
             utils::letterbox(img, output.transform_matrix, config_.target_w, config_.target_h);
         const auto input = compiled_model_->input();
@@ -232,8 +303,10 @@ struct NetDetectorOpenVINO::Impl {
             input.get_shape(),
             output.resized_img.data
         );
+        const auto inference_start = std::chrono::steady_clock::now();
 
         const auto output_tensor = infer_buffer(input_tensor);
+        const auto output_copy_start = std::chrono::steady_clock::now();
         const auto& shape = output_tensor.get_shape();
         auto ptr = output_tensor.data<float>();
 
@@ -242,6 +315,19 @@ struct NetDetectorOpenVINO::Impl {
         } else if (shape.size() == 4) {
             output.output = cv::Mat(shape[2], shape[3], CV_32F, (void*)ptr).clone();
         }
+        const auto output_copy_end = std::chrono::steady_clock::now();
+        output.preprocess_ms = std::chrono::duration<double, std::milli>(
+                                   inference_start - preprocess_start
+        )
+                                   .count();
+        output.inference_ms = std::chrono::duration<double, std::milli>(
+                                  output_copy_start - inference_start
+        )
+                                  .count();
+        output.output_copy_ms = std::chrono::duration<double, std::milli>(
+                                    output_copy_end - output_copy_start
+        )
+                                    .count();
 
         return output;
     }

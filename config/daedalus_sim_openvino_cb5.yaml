@@ -1,15 +1,19 @@
-# Daedalus simulation-only configuration (derived from config/test.yaml)
-mode: auto_aim
+# Daedalus CB5 OpenVINO auto-buff baseline: two detectors / two infer requests.
+# Rune model: SZU model-0624.onnx, output [1,18,6300]
+#   3 class scores: 0=inactive, 1=small_activated, 2=big_activated
+#   5 keypoints: kpt0/1/3/4 = armor-plate corners, kpt2 = R center
+# CPU resource settings are target-dependent; keep one stream as the portable baseline.
+mode: auto_buff
 enemy_color: blue
 bullet_speed: 23.5
 
 serial:
   enable: false
-  device_name: /dev/ttyACM0 
+  device_name: /dev/ttyACM0
   baud_rate: 115200
   char_size: 8
   read_buf_size: 4096
-serial_send_to_image_microseconds: 0
+serial_send_to_image_microseconds: -6000
 use_sim: true
 
 record:
@@ -30,7 +34,7 @@ bullet_pick_up:
   ballistic_trajectory:
     gravity: 9.8
     resistance: 0.001
-  
+
 auto_exposure:
   enable: false
   target_brightness: 35.0
@@ -44,7 +48,7 @@ auto_exposure:
 
 armor_detector:
   max_infer_num: 5
-  backend: openvino
+  backend: tensorrt
   net_detector:
     openvino:
       model_path: ${ROOT_DIR}/model/opt-1208-001.onnx
@@ -81,13 +85,13 @@ armor_detector:
       min_ratio: 0.8
       max_ratio: 5.0
 
-      
+
 armor_tracker:
   lost_time_thres: 1.5
   lost_time_thres_outpost: 2.0
   tracking_thres: 10
   qxyz_common: [30.0, 30.0, 1.0]
-  qyaw_common: 30.0
+  qyaw_common: 300.0
   qxyz_output: [1.0, 1.0, 1.0]
   qyaw_output: 0.01
   q_r: 0.0000001
@@ -100,14 +104,14 @@ armor_tracker:
   armor_match_gate_not_all_init: 1000.0
   armor_match_w_center_err: 5.0
   armor_match_w_angle_err: 10.0
-  armor_match_w_side_length_err: 1.0
+  armor_match_w_side_length_err: 10.0
   light_match_length_ratio_gate: 0.2
   light_match_angle_gate: 0.2
   light_match_pos_gate_by_length_ratio: 5.0
   r_sigma_px_by_length_ratio: 0.2
   r_sigma_length_by_length_ratio: 0.5
   r_sigma_angle: 0.1
-  r_sigma_armor_lights_depth_diff: 0.1
+  r_sigma_armor_lights_depth_diff: 10
   esekf_iter_num: 5
 
 
@@ -115,11 +119,11 @@ armor_tracker:
 
 
 
-  
+
 auto_aim_fsm:
-  single_whole_up: 1.5 
+  single_whole_up: 1.5
   single_whole_down: 1.0
-  whole_pair_up: 17.5 
+  whole_pair_up: 17.5
   whole_pair_down: 6.5 #1s内至少换2次板子  2pi  否则轨迹规划无意义
   pair_center_up: 16.5
   pair_center_down: 15.0
@@ -149,25 +153,34 @@ very_aimer:
     resistance: 0.001
 
 rune_detector:
-  max_infer_num: 5
+  max_infer_num: 2
   backend: openvino
   net_detector:
     openvino:
-      model_path: ${ROOT_DIR}/model/cb_rune.onnx
+      model_path: ${ROOT_DIR}/model/model-0624.onnx
       device_name: "CPU"
-      perf_mode: "THROUGHPUT"
+      perf_mode: "LATENCY"
       priority: "HIGH"
-      # scheduling_core_type: "PCORE_ONLY"
       execution_mode: "PERFORMANCE"
-      infer_request_buffer_num: 10
+      # OpenVINO internal streams. 1 favors per-request latency; benchmark before increasing.
+      num_streams: 1
+      # Optional hardware-dependent controls; omit them to keep OpenVINO auto-selection.
+      # inference_num_threads: 8
+      # enable_cpu_pinning: true
+      # scheduling_core_type: "ANY_CORE" # ANY_CORE / PCORE_ONLY / ECORE_ONLY
+      # Match the two external detector slots below; this does not change queue semantics.
+      infer_request_buffer_num: 2
     tensorrt:
-      model_path: ${ROOT_DIR}/model/cb_rune.onnx
+      model_path: ${ROOT_DIR}/model/model-0624.onnx
       copy_context_num: 3
       min_free_mem_ratio: 0.1
       use_cuda_preproces: true
     rune_infer:
-      model_type: cb
-      conf_threshold: 0.2
+      model_type: cb5
+      conf_threshold: 0.30
+      keypoint_conf_threshold: 0.30
+      nms_distance: 30.0
+      min_valid_kpts: 4
   cv:
     bin_threshold: 70
     color_diff_thresh: 10
@@ -182,16 +195,16 @@ rune_detector:
 
 
 rune_tracker:
-  lost_time_thres: 2.0
-  tracking_thres: 10
+  lost_time_thres: 1.0
+  tracking_thres: 5
   esekf_iter_num: 5
-  q_xyz: [0.0001, 0.0001, 0.0001]
-  q_yaw: 0.1
-  q_roll: 10.0
-  q_a: 0.01
-  q_w: 0.01
+  q_xyz: [0.000000000001, 0.00000000000001, 0.000000000001]
+  q_yaw: 0.00000000000000001
+  q_roll: 0.01
+  q_a: 100.0
+  q_w: 10000.0
   q_tau: 0.01
-  match_gate: 30.0
+  match_gate: 100.0
   voter_state_need_count: 50
   voter_mode_need_count: 20
   big_args_continue_time: 1.0
@@ -204,7 +217,7 @@ rune_aimer:
   sample_total_time: 0.5
   sample_horizon: 10
   prediction_delay: -0.00
-  max_yaw_acc: 40 
+  max_yaw_acc: 40
   max_pitch_acc: 50
   shooting_range_h: 0.12
   shooting_range_w: 0.12
@@ -215,7 +228,7 @@ rune_aimer:
     resistance: 0.001
 
 
-camera: 
+camera:
   hik_camera:
     target_sn: DA1094115
     adc_bit_depth: Bits_8
@@ -228,13 +241,13 @@ camera:
     offset_y: 0
     acquisition_frame_rate_enable: false
     acquisition_frame_rate: 60
-    exposure_time: 2000
+    exposure_time: 3000
     gain: 16.9
     gamma: 0.7 #Bayer用不了
     trigger_mode: Off
     trigger_source: ""
     trigger_activation: ""
-    format: "bgr" 
+    format: "bgr"
     use_cuda_cvt: true
   mv_camera:
     frame_speed: 0
@@ -356,3 +369,16 @@ camera:
     #   data: [1016.2797 ,    0.     ,  655.30471,    0.     ,
     #             0.     , 1021.00509,  517.31738,    0.     ,
     #             0.     ,    0.     ,    1.     ,    0.     ]
+
+# Task15 诊断日志（默认关闭；./script/task15_diag.sh <run-name> 可临时开启）
+diagnostics:
+  enable: false
+  output_dir: diagnostics/task15
+  aimer_hz: 200.0
+  gimbal_hz: 200.0
+  event_cooldown_ms: 50.0
+  car_roll_threshold_deg: 8.0
+  car_pitch_threshold_deg: 8.0
+  attitude_step_threshold_deg: 5.0
+  cmd_yaw_jump_threshold_deg: 2.0
+  cmd_pitch_jump_threshold_deg: 2.0

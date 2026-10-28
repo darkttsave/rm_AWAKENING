@@ -10,6 +10,9 @@ public:
         cv::Mat output;
         Eigen::Matrix3f transform_matrix;
         cv::Mat resized_img;
+        double preprocess_ms = 0.0;
+        double inference_ms = 0.0;
+        double output_copy_ms = 0.0;
     };
     struct Config {
         PixelFormat target_format;
