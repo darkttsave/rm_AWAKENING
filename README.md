@@ -147,9 +147,14 @@ git clone --recurse-submodules https://github.com/WUST-RM/awakening.git
 
 cd awakening
 
-sudo ./run.sh build
+# 日常构建：TensorRT + OpenVINO 双后端，产物为 bin/standard
+cmake -S . -B build-trt -G Ninja \
+    -DBUILD_WITH_TRT=ON -DBUILD_WITH_OPENVINO=ON
+cmake --build build-trt -j2
 
-sudo ./run.sh run standard omni true
+# 启动：后端由 yaml 的 backend 字段选择
+# 运行前需保证 ROS / TensorRT / OpenVINO 的库路径已在环境中（LD_LIBRARY_PATH）
+sudo ./bin/standard omni true
 ```
 
 ---
@@ -166,18 +171,13 @@ python3 web.py
 
 ## ⚙️ 运行脚本
 
-`run.sh` 支持以下命令：
+日常构建与启动请使用上面的 `build-trt` + `bin/standard` 流程。`run.sh` 中依赖 `build/`
+的 `build` / `rebuild` / `run` / `debug` 已与当前工具链不匹配，请勿用于日常构建。
+
+实车自启动仍使用 `run.sh race`（不构建，直接运行 `bin/` 下的程序）：
 
 ```bash
-sudo ./run.sh build                  # 配置并增量构建
-
-sudo ./run.sh rebuild                 # 删除 build 后全量重构
-
-sudo ./run.sh run <program> [args]    # 构建后运行
-
-sudo ./run.sh race <program> [args]   # 不构建，直接运行 bin 下程序
-
-sudo ./run.sh debug <program> [args]  # 构建后使用 gdb 启动
+sudo ./run.sh race <program> [args]
 ```
 
 ---
