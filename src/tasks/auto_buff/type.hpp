@@ -11,6 +11,8 @@
 namespace awakening::auto_buff {
 constexpr double RUNE_FAN_TARGET_BOX_DIS_HALF = 0.15 / 2.0;
 constexpr double RUNE_FAN_TARGET_R = 0.115;
+// SZU model-0624 的四个关键点在靶面圆周上，半径实测约 0.15m。
+constexpr double CB5_FAN_TARGET_R = 0.15;
 constexpr double RUNE_R2_FAN_TARGET_CENTER = 0.70;
 constexpr double FUCK = 0.015;
 constexpr int FAN_NUM = 5;
@@ -19,12 +21,50 @@ enum class RuneColor : int {
     BLUE = 1,
     NONE = -1,
 };
+// CB5 的三类别表示“激活状态”，不是红蓝颜色。
+enum class RuneActivation : int {
+    UNKNOWN = -1,
+    INACTIVE = 0,
+    SMALL_ACTIVATED = 1,
+    BIG_ACTIVATED = 2,
+};
+inline const char* rune_activation_name(RuneActivation activation) noexcept {
+    switch (activation) {
+        case RuneActivation::INACTIVE:
+            return "inactive";
+        case RuneActivation::SMALL_ACTIVATED:
+            return "small_activated";
+        case RuneActivation::BIG_ACTIVATED:
+            return "big_activated";
+        default:
+            return "unknown";
+    }
+}
+// CB9 与 CB5 都输出靶面圆周上的上/左/下/右四点，但半径不同。
+enum class RuneBladeGeometry : int {
+    CARDINAL_4 = 0, // CB9: r = 0.115m
+    CARDINAL_4_R150 = 1, // CB5: r = 0.15m
+};
 
 struct RuneFanBladeWithR {
     enum PointsIndex { TOP, LEFT, BOTTOM, RIGHT, CENTER, R, N };
     template<typename PointT>
     struct Point3DRZERO {
-        inline static std::vector<PointT> build() {
+        inline static std::vector<PointT> build(
+            RuneBladeGeometry geometry = RuneBladeGeometry::CARDINAL_4
+        ) {
+            if (geometry == RuneBladeGeometry::CARDINAL_4_R150) {
+                // CB5: model-0624 的 0/1/3/4 分别是上/左/右/下，R 为 2。
+                // 四点在同一靶面圆周上，实测半径约 0.15m。
+                return {
+                    PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER + CB5_FAN_TARGET_R), // TOP
+                    PointT(0, CB5_FAN_TARGET_R, RUNE_R2_FAN_TARGET_CENTER), // LEFT
+                    PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER - CB5_FAN_TARGET_R), // BOTTOM
+                    PointT(0, -CB5_FAN_TARGET_R, RUNE_R2_FAN_TARGET_CENTER), // RIGHT
+                    PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER), // 中
+                    PointT(0, 0, 0),
+                };
+            }
             return {
                 PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER + RUNE_FAN_TARGET_R), // 上
                 PointT(0, RUNE_FAN_TARGET_R, RUNE_R2_FAN_TARGET_CENTER), // 左
@@ -34,14 +74,12 @@ struct RuneFanBladeWithR {
                 PointT(0, 0, 0),
             };
         }
-        inline static std::vector<PointT> build_no_r() {
-            return {
-                PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER + RUNE_FAN_TARGET_R), // 上
-                PointT(0, RUNE_FAN_TARGET_R, RUNE_R2_FAN_TARGET_CENTER), // 左
-                PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER - RUNE_FAN_TARGET_R), // 下
-                PointT(0, -RUNE_FAN_TARGET_R, RUNE_R2_FAN_TARGET_CENTER), // 右
-                PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER), // 中
-            };
+        inline static std::vector<PointT> build_no_r(
+            RuneBladeGeometry geometry = RuneBladeGeometry::CARDINAL_4
+        ) {
+            auto points = build(geometry);
+            points.pop_back();
+            return points;
         }
     };
     template<typename PointT>
@@ -69,10 +107,16 @@ struct RuneFanBladeWithR {
 
     std::vector<cv::Point2f> points;
     std::vector<std::vector<cv::Point2f>> tmp_points;
-    ISO3 pose;
+    // CB5 原始五点顺序（0/1/3/4 为靶面四角，2 为 R），只用于诊断。
+    std::array<cv::Point2f, 5> raw_points {};
+    std::array<float, 5> raw_confidences {};
+    ISO3 pose = ISO3::Identity();
     cv::Rect2f bbox;
     RuneColor color = RuneColor::NONE;
+    RuneActivation activation = RuneActivation::UNKNOWN;
+    RuneBladeGeometry geometry = RuneBladeGeometry::CARDINAL_4;
     double confidence = 0;
+    bool pose_valid = false;
     void draw(cv::Mat& img) const {
         for (int i = 0; i < points.size(); ++i) {
             cv::circle(img, points[i], 5, cv::Scalar(0, 255, 0), cv::FILLED);
@@ -82,10 +126,16 @@ struct RuneFanBladeWithR {
         for (auto& point: points) {
             point += offset;
         }
+        for (auto& point: raw_points) {
+            point += offset;
+        }
         bbox += offset;
     }
     void transform(const Eigen::Matrix<float, 3, 3>& transform_matrix) noexcept {
         for (auto& point: points) {
+            point = utils::transform_point2D(transform_matrix, point);
+        }
+        for (auto& point: raw_points) {
             point = utils::transform_point2D(transform_matrix, point);
         }
         bbox = utils::transform_rect(transform_matrix, bbox);
@@ -127,7 +177,8 @@ struct RuneFanTarget {
     cv::Point2f center;
     RuneColor color = RuneColor::NONE;
     cv::RotatedRect rr;
-    ISO3 pose;
+    ISO3 pose = ISO3::Identity();
+    bool pose_valid = false;
     enum PointsIndex { LT, LB, RB, RT, CENTER, N };
     template<typename PointT>
     struct Point3DRZERO {

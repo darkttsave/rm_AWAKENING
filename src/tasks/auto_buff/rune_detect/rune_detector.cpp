@@ -3,6 +3,7 @@
 #include "tasks/auto_buff/type.hpp"
 #include "tasks/base/common.hpp"
 #include "utils/common/image.hpp"
+#include "utils/logger.hpp"
 #include <cstdlib>
 #include <memory>
 #include <opencv2/core/mat.hpp>
@@ -463,47 +464,72 @@ struct RuneDetector::Impl {
     RuneDetection
     detect(const CommonFrame& frame, const cv::Rect& focus, EnemyColor enemy_color) const noexcept {
         RuneDetection result;
-        cv::Mat roi = frame.img_frame.src_img(focus);
-        if (net_detector_) {
-            utils::NetDetectorBase::OutPut net_output;
-            net_output = net_detector_->detect(roi, frame.img_frame.format);
-            result.fan_blades = rune_infer_->process(net_output.output);
-            for (auto& fan_blade: result.fan_blades) {
-                fan_blade.transform(net_output.transform_matrix);
-                fan_blade.add_offset(focus.tl());
+        // 所有 OpenCV/模型异常都必须在 noexcept 边界内被吞掉，否则 std::terminate。
+        try {
+            const cv::Mat& src = frame.img_frame.src_img;
+            if (src.empty()) {
+                return result;
             }
-        }
-        CVCtx cv1;
-        cv1.src = roi;
-        cv1.bin = preprocess(roi, frame.img_frame.format, enemy_color);
-        cv::findContours(
-            cv1.bin,
-            cv1.contours,
-            cv1.hierarchy,
-            cv::RETR_TREE,
-            cv::CHAIN_APPROX_SIMPLE
-        );
+            const cv::Rect focus_rect = focus & cv::Rect(0, 0, src.cols, src.rows);
+            if (focus_rect.width <= 0 || focus_rect.height <= 0) {
+                return result;
+            }
+            cv::Mat roi = src(focus_rect);
+            if (net_detector_ && rune_infer_) {
+                utils::NetDetectorBase::OutPut net_output;
+                net_output = net_detector_->detect(roi, frame.img_frame.format);
+                if (!net_output.output.empty()) {
+                    result.fan_blades = rune_infer_->process(net_output.output);
+                    for (auto& fan_blade: result.fan_blades) {
+                        fan_blade.transform(net_output.transform_matrix);
+                        fan_blade.add_offset(focus_rect.tl());
+                    }
+                } else {
+                    AWAKENING_WARN("rune detector: empty network output");
+                }
+            }
+            CVCtx cv1;
+            cv1.src = roi;
+            cv1.bin = preprocess(roi, frame.img_frame.format, enemy_color);
+            cv::findContours(
+                cv1.bin,
+                cv1.contours,
+                cv1.hierarchy,
+                cv::RETR_TREE,
+                cv::CHAIN_APPROX_SIMPLE
+            );
 
-        cv1.used_flags.assign(cv1.contours.size(), false);
-        color_filter(cv1, frame.img_frame.format, enemy_color);
-        result.fan_targets = get_rune_fan_targets(cv1);
-        result.rune_flowing_lights = get_rune_flowings(cv1);
-        auto roi_center = cv::Point2f(focus.width / 2.0, focus.height / 2.0);
-        double side = focus.width / 2.0;
-        cv::Rect focus_r =
-            cv::Rect(roi_center.x - side / 2.0, roi_center.y - side / 2.0, side, side);
-        result.rune_rs = get_rune_rs(cv1, focus_r);
-        for (auto& rune_r: result.rune_rs) {
-            rune_r.color = get_color(cv1.src, rune_r.rr.boundingRect2f(), frame.img_frame.format);
-            rune_r.add_offset(focus.tl());
-        }
-        for (auto& rune_flowing_light: result.rune_flowing_lights) {
-            rune_flowing_light.add_offset(focus.tl());
-        }
-        for (auto& fan_target: result.fan_targets) {
-            fan_target.color =
-                get_color(cv1.src, fan_target.rr.boundingRect2f(), frame.img_frame.format);
-            fan_target.add_offset(focus.tl());
+            cv1.used_flags.assign(cv1.contours.size(), false);
+            color_filter(cv1, frame.img_frame.format, enemy_color);
+            result.fan_targets = get_rune_fan_targets(cv1);
+            result.rune_flowing_lights = get_rune_flowings(cv1);
+            auto roi_center = cv::Point2f(focus_rect.width / 2.0, focus_rect.height / 2.0);
+            double side = focus_rect.width / 2.0;
+            cv::Rect focus_r =
+                cv::Rect(roi_center.x - side / 2.0, roi_center.y - side / 2.0, side, side);
+            result.rune_rs = get_rune_rs(cv1, focus_r);
+            for (auto& rune_r: result.rune_rs) {
+                rune_r.color =
+                    get_color(cv1.src, rune_r.rr.boundingRect2f(), frame.img_frame.format);
+                rune_r.add_offset(focus_rect.tl());
+            }
+            for (auto& rune_flowing_light: result.rune_flowing_lights) {
+                rune_flowing_light.add_offset(focus_rect.tl());
+            }
+            for (auto& fan_target: result.fan_targets) {
+                fan_target.color =
+                    get_color(cv1.src, fan_target.rr.boundingRect2f(), frame.img_frame.format);
+                fan_target.add_offset(focus_rect.tl());
+            }
+        } catch (const cv::Exception& e) {
+            AWAKENING_ERROR("rune detector OpenCV error: {}", e.what());
+            result.fan_blades.clear();
+        } catch (const std::exception& e) {
+            AWAKENING_ERROR("rune detector error: {}", e.what());
+            result.fan_blades.clear();
+        } catch (...) {
+            AWAKENING_ERROR("rune detector unknown error");
+            result.fan_blades.clear();
         }
         return result;
     }

@@ -79,6 +79,9 @@ namespace {
         std::vector<YPDVecZ> meas_list(n_obs);
         for (int obs = 0; obs < n_obs; ++obs) {
             pnp(fans[obs]);
+            if (!fans[obs].pose_valid) {
+                continue;
+            }
             meas_list[obs] = target.get_ypdmeasurement(fans[obs].pose);
         }
 
@@ -147,9 +150,16 @@ bool RuneTarget::reset(
 ) {
     cfg = c;
     std::optional<ISO3> pose;
+    RuneBladeGeometry blade_geometry = RuneBladeGeometry::CARDINAL_4;
     if (!d.fan_blades.empty()) {
-        fan_pnp(d.fan_blades.front(), camera_info, camera_cv_in_odom, true);
-        pose = d.fan_blades.front().pose;
+        for (auto& fan: d.fan_blades) {
+            fan_pnp(fan, camera_info, camera_cv_in_odom, true);
+            if (fan.pose_valid) {
+                pose = fan.pose;
+                blade_geometry = fan.geometry;
+                break;
+            }
+        }
     } else if (!d.fan_targets.empty() && !d.rune_rs.empty()) {
         const auto closest = std::min_element(
             d.rune_rs.begin(),
@@ -174,7 +184,9 @@ bool RuneTarget::reset(
                 camera_cv_in_odom,
                 true
             );
-            pose = d.fan_targets.front().pose;
+            if (d.fan_targets.front().pose_valid) {
+                pose = d.fan_targets.front().pose;
+            }
         }
     }
     if (!pose) {
@@ -188,6 +200,7 @@ bool RuneTarget::reset(
         .id = 0,
         .camera_cv_in_odom = camera_cv_in_odom,
         .camera_info = camera_info.clone(),
+        .geometry = blade_geometry,
     };
     fan_target_ctx = {
         .id = 0,
@@ -249,53 +262,65 @@ void RuneTarget::fan_pnp(
     const ISO3& camera_cv_in_odom,
     bool in_r
 ) noexcept {
-    auto key_points = r.points;
-    // std::vector<cv::Mat> rvecs;
-    // std::vector<cv::Mat> tvecs;
-    // if (!cv::solvePnPGeneric(
-    //         in_r ? RuneFanBladeWithR::Point3DRZERO<cv::Point3f>::build()
-    //              : RuneFanBladeWithR::Point3DTargetCenterZERO<cv::Point3f>::build(),
-    //         key_points,
-    //         camera_info.camera_matrix,
-    //         camera_info.distortion_coefficients,
-    //         rvecs,
-    //         tvecs,
-    //         false,
-    //         cv::SOLVEPNP_IPPE,
-    //         cv::noArray(),
-    //         cv::noArray()
-    //     ))
-    // {
-    //     return;
-    // }
-
-    // bool has_valid = false;
-    // for (size_t i = 0; i < rvecs.size(); ++i) {
-    //     cv::Mat R_cv;
-    //     cv::Rodrigues(rvecs[i], R_cv);
-    //     Mat3 R_eigen;
-    //     cv::cv2eigen(R_cv, R_eigen);
-    //     Vec3 axis_x = R_eigen.col(0);
-    //     Vec3 t_eigen;
-    //     cv::cv2eigen(tvecs[i], t_eigen);
-    //     Vec3 front_normal = -axis_x;
-    //     if (front_normal.dot(-t_eigen) > 0)
-    //     { //选择正面朝向相机，这里重投影误差已经进行过排序，所以直接break
-    //         r.pose.translation() = t_eigen;
-    //         r.pose.linear() = R_eigen;
-    //         has_valid = true;
-    //         break;
-    //     }
-    // }
-    r.pose = utils::solve_pnp(
-        key_points,
-        in_r ? RuneFanBladeWithR::Point3DRZERO<cv::Point3f>::build()
-             : RuneFanBladeWithR::Point3DTargetCenterZERO<cv::Point3f>::build(),
-        camera_info.camera_matrix,
-        camera_info.distortion_coefficients
-    );
-
-    r.pose = camera_cv_in_odom * r.pose;
+    r.pose_valid = false;
+    if (r.points.size() != RuneFanBladeWithR::N) {
+        return;
+    }
+    for (const auto& p: r.points) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y)) {
+            return;
+        }
+    }
+    try {
+        auto key_points = r.points;
+        std::vector<cv::Point3f> object_points;
+        if (in_r) {
+            object_points = RuneFanBladeWithR::Point3DRZERO<cv::Point3f>::build(r.geometry);
+        } else {
+            object_points =
+                RuneFanBladeWithR::Point3DTargetCenterZERO<cv::Point3f>::build();
+        }
+        if (key_points.size() != object_points.size()) {
+            return;
+        }
+        // CB5 的 R 点由模型直接给出，参与 PnP 可消除平面靶标的 z 轴二义性；
+        // 若只用四角，投影出的 R 可能落在靶心另一侧。
+        auto pose = utils::solve_pnp(
+            key_points,
+            object_points,
+            camera_info.camera_matrix,
+            camera_info.distortion_coefficients
+        );
+        if (!pose.matrix().allFinite()) {
+            return;
+        }
+        // 模型在激活/大符过渡帧上可能把中心 R 附近的点当成靶面四点，
+        // 这类观测的 PnP 深度和重投影误差都会明显异常，不能送入 Tracker。
+        if (pose.translation().z() < 0.2 || pose.translation().z() > 20.0) {
+            return;
+        }
+        const auto reproj = utils::reprojection(
+            camera_info.camera_matrix,
+            camera_info.distortion_coefficients,
+            object_points,
+            pose
+        );
+        double reproj_sum = 0.0;
+        for (size_t i = 0; i < reproj.size(); ++i) {
+            reproj_sum += cv::norm(reproj[i] - key_points[i]);
+        }
+        if (reproj.empty() || reproj_sum / static_cast<double>(reproj.size()) > 8.0) {
+            return;
+        }
+        r.pose = camera_cv_in_odom * pose;
+        r.pose_valid = r.pose.matrix().allFinite();
+    } catch (const cv::Exception& e) {
+        AWAKENING_WARN("rune fan pnp OpenCV error: {}", e.what());
+    } catch (const std::exception& e) {
+        AWAKENING_WARN("rune fan pnp error: {}", e.what());
+    } catch (...) {
+        AWAKENING_WARN("rune fan pnp unknown error");
+    }
 }
 void RuneTarget::fan_target_pnp(
     RuneFanTarget& a,
@@ -304,6 +329,7 @@ void RuneTarget::fan_target_pnp(
     const ISO3& camera_cv_in_odom,
     bool in_r
 ) noexcept {
+    a.pose_valid = false;
     a.sort_corners(r);
     auto key_points = a.key_points;
     // std::vector<cv::Mat> rvecs;
@@ -343,14 +369,26 @@ void RuneTarget::fan_target_pnp(
     //         break;
     //     }
     // }
-    a.pose = utils::solve_pnp(
-        key_points,
-        in_r ? RuneFanTarget::Point3DRZERO<cv::Point3f>::build_no_r()
-             : RuneFanTarget::Point3DTargetCenterZERO<cv::Point3f>::build_no_r(),
-        camera_info.camera_matrix,
-        camera_info.distortion_coefficients
-    );
-    a.pose = camera_cv_in_odom * a.pose;
+    try {
+        auto pose = utils::solve_pnp(
+            key_points,
+            in_r ? RuneFanTarget::Point3DRZERO<cv::Point3f>::build_no_r()
+                 : RuneFanTarget::Point3DTargetCenterZERO<cv::Point3f>::build_no_r(),
+            camera_info.camera_matrix,
+            camera_info.distortion_coefficients
+        );
+        if (!pose.matrix().allFinite()) {
+            return;
+        }
+        a.pose = camera_cv_in_odom * pose;
+        a.pose_valid = a.pose.matrix().allFinite();
+    } catch (const cv::Exception& e) {
+        AWAKENING_WARN("rune target pnp OpenCV error: {}", e.what());
+    } catch (const std::exception& e) {
+        AWAKENING_WARN("rune target pnp error: {}", e.what());
+    } catch (...) {
+        AWAKENING_WARN("rune target pnp unknown error");
+    }
 }
 [[nodiscard]] Eigen::Matrix<double, motion_model::X_N, motion_model::X_N>
 RuneTarget::process_noise(double dt) const noexcept {
@@ -478,6 +516,10 @@ std::tuple<int, int> RuneTarget::update(
     const ISO3& camera_cv_in_odom
 ) {
     std::vector<std::shared_ptr<ESEKF::ObsBase>> obs;
+    if (!matched_fans.empty()) {
+        // CB5/CB9 的几何模型必须与观测一致；模式在配置中固定，这里再同步一次。
+        fan_ctx.geometry = matched_fans.front().second.geometry;
+    }
     auto pred_state = target_state;
     pred_state.predict(timestamp, voter);
     FanBladeVecZ fan_prediction;

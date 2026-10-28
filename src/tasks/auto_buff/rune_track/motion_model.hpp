@@ -237,6 +237,7 @@ struct FanBladeMeasure {
         int id = 0;
         ISO3 camera_cv_in_odom = ISO3::Identity();
         CameraInfo camera_info;
+        RuneBladeGeometry geometry = RuneBladeGeometry::CARDINAL_4;
     } ctx;
 
     template<typename T>
@@ -248,7 +249,7 @@ struct FanBladeMeasure {
         auto pose_in_camera_cv = camera_cv_in_odom_jet.inverse() * pose_in_odom;
         std::vector<Eigen::Matrix<T, 2, 1>> img_pts_jet;
         utils::project_points_jets(
-            RuneFanBladeWithR::Point3DRZERO<cv::Point3f>::build(),
+            RuneFanBladeWithR::Point3DRZERO<cv::Point3f>::build(ctx.geometry),
             pose_in_camera_cv,
             ctx.camera_info.camera_matrix,
             ctx.camera_info.distortion_coefficients,

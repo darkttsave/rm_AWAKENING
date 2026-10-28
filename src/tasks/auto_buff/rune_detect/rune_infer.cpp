@@ -1,10 +1,14 @@
 #include "rune_infer.hpp"
 #include "tasks/auto_buff/type.hpp"
+#include "utils/logger.hpp"
 #include "utils/utils.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace awakening::auto_buff {
@@ -12,16 +16,16 @@ static constexpr float MERGE_CONF_ERROR = 0.95f;
 static constexpr float MERGE_MIN_IOU = 0.9f;
 static constexpr float NMS_THRESHOLD = 0.35;
 static constexpr int TOP_K = 128;
-enum class Mode : int { CB };
+enum class Mode : int { CB, CB5 };
 inline Mode modeFromString(const std::string& s) noexcept {
     std::string str = utils::to_upper(s);
-    if (str == "CB")
-        return Mode::CB;
+    if (str == "CB5" || str == "SZU5" || str == "FIVE")
+        return Mode::CB5;
     return Mode::CB;
 }
 template<Mode M>
 struct ModelTraits; // declare
-// TUP
+// TUP / 原九点模型
 template<>
 struct ModelTraits<Mode::CB> {
     static constexpr int INPUT_W = 640;
@@ -32,6 +36,20 @@ struct ModelTraits<Mode::CB> {
     static constexpr int NUM_CLASSES = 2;
     static constexpr int KPT_DIM = 3; // x, y, visibility per keypoint
     static constexpr int KPT_START = 6; // keypoints start at row 6 (after 4 bbox + 2 class)
+    static constexpr PixelFormat TARGET_FORMAT = PixelFormat::RGB;
+};
+// 深圳大学 model-0624：3 类激活状态 + 5 关键点，输出 [1,18,6300]。
+template<>
+struct ModelTraits<Mode::CB5> {
+    static constexpr int INPUT_W = 640;
+    static constexpr int INPUT_H = 480;
+    static constexpr bool USE_NORM = true;
+    static constexpr int NUM_POINTS = 5;
+    static constexpr int REMAPPED_KPTS = 6;
+    static constexpr int NUM_CLASSES = 3;
+    static constexpr int KPT_DIM = 3;
+    static constexpr int KPT_START = 3; // 3 class scores, then 5 * (x, y, conf)
+    static constexpr int R_INDEX = 2; // 实测 model-0624：kpt[2] 是 R 标中心
     static constexpr PixelFormat TARGET_FORMAT = PixelFormat::RGB;
 };
 
@@ -103,14 +121,46 @@ inline std::vector<RuneFanBladeWithR> topk_and_nms(std::vector<RuneFanBladeWithR
 
     return result;
 }
+
+// CB5 使用中心点距离 NMS，而不是 BBox IoU（模型不输出独立 bbox）。
+inline std::vector<RuneFanBladeWithR>
+nms_by_center(std::vector<RuneFanBladeWithR> objs, float distance_threshold) {
+    std::sort(objs.begin(), objs.end(), [](const RuneFanBladeWithR& a, const RuneFanBladeWithR& b) {
+        return a.confidence > b.confidence;
+    });
+    if (static_cast<int>(objs.size()) > TOP_K)
+        objs.resize(static_cast<size_t>(TOP_K));
+
+    const float d2 = distance_threshold * distance_threshold;
+    std::vector<RuneFanBladeWithR> result;
+    result.reserve(objs.size());
+    for (auto& obj: objs) {
+        const cv::Point2f center = obj.points[RuneFanBladeWithR::CENTER];
+        bool keep = true;
+        for (const auto& kept: result) {
+            const cv::Point2f diff = center - kept.points[RuneFanBladeWithR::CENTER];
+            if (diff.dot(diff) < d2) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep)
+            result.push_back(std::move(obj));
+    }
+    return result;
+}
+
 struct RuneInfer::Impl {
     struct Params {
         double conf_threshold = 0.1;
-        Mode mode;
-        int input_w;
-        int input_h;
-        bool use_norm;
-        PixelFormat target_format;
+        double keypoint_conf_threshold = 0.3;
+        double nms_distance = 30.0;
+        int min_valid_kpts = 4;
+        Mode mode = Mode::CB;
+        int input_w = ModelTraits<Mode::CB>::INPUT_W;
+        int input_h = ModelTraits<Mode::CB>::INPUT_H;
+        bool use_norm = ModelTraits<Mode::CB>::USE_NORM;
+        PixelFormat target_format = ModelTraits<Mode::CB>::TARGET_FORMAT;
         template<typename M>
         void set_mode() {
             input_w = M::INPUT_W;
@@ -126,8 +176,21 @@ struct RuneInfer::Impl {
                     set_mode<ModelTraits<Mode::CB>>();
                     break;
                 }
+                case Mode::CB5: {
+                    set_mode<ModelTraits<Mode::CB5>>();
+                    break;
+                }
             }
             conf_threshold = config["conf_threshold"].as<double>();
+            if (config["keypoint_conf_threshold"]) {
+                keypoint_conf_threshold = config["keypoint_conf_threshold"].as<double>();
+            }
+            if (config["nms_distance"]) {
+                nms_distance = config["nms_distance"].as<double>();
+            }
+            if (config["min_valid_kpts"]) {
+                min_valid_kpts = config["min_valid_kpts"].as<int>();
+            }
         }
     } params_;
     Impl(const YAML::Node& config) {
@@ -135,9 +198,21 @@ struct RuneInfer::Impl {
     }
 
     [[nodiscard]] std::vector<RuneFanBladeWithR> process(const cv::Mat& output_buffer) const {
-        std::vector<RuneFanBladeWithR> results;
-        results = post_process(output_buffer);
-        return topk_and_nms(results);
+        try {
+            auto results = post_process(output_buffer);
+            switch (params_.mode) {
+                case Mode::CB:
+                    // 保持原九点模式的后处理路径不变。
+                    return topk_and_nms(results);
+                case Mode::CB5:
+                    return nms_by_center(std::move(results), static_cast<float>(params_.nms_distance));
+            }
+        } catch (const std::exception& e) {
+            AWAKENING_ERROR("rune infer postprocess failed: {}", e.what());
+        } catch (...) {
+            AWAKENING_ERROR("rune infer postprocess failed: unknown exception");
+        }
+        return {};
     }
     [[nodiscard]] std::vector<RuneFanBladeWithR> post_process(const cv::Mat& output_buffer) const {
         if (output_buffer.empty())
@@ -145,6 +220,8 @@ struct RuneInfer::Impl {
         switch (params_.mode) {
             case Mode::CB:
                 return post_processCB_impl(output_buffer);
+            case Mode::CB5:
+                return post_processCB5_impl(output_buffer);
         }
         return {};
     }
@@ -207,6 +284,109 @@ struct RuneInfer::Impl {
             results.push_back(rune);
         }
         return topk_and_nms(results);
+    }
+
+    // model-0624: 3 class scores + 5 keypoints * (x, y, conf) = 18 channels.
+    std::vector<RuneFanBladeWithR> post_processCB5_impl(const cv::Mat& out) const {
+        constexpr int channels = ModelTraits<Mode::CB5>::NUM_CLASSES
+            + ModelTraits<Mode::CB5>::NUM_POINTS * ModelTraits<Mode::CB5>::KPT_DIM;
+        if (out.empty() || out.type() != CV_32F) {
+            AWAKENING_ERROR("CB5 output is empty or not CV_32F");
+            return {};
+        }
+        // 同时兼容 [C, A] 和 [A, C] 两种导出布局。
+        const bool channel_first = out.rows == channels;
+        const bool channel_last = out.cols == channels;
+        if (!channel_first && !channel_last) {
+            AWAKENING_ERROR(
+                "CB5 output shape mismatch: {}x{}, expected {} channels",
+                out.rows,
+                out.cols,
+                channels
+            );
+            return {};
+        }
+        const int anchors = channel_first ? out.cols : out.rows;
+        const auto at = [&](int c, int i) -> float {
+            return channel_first ? out.at<float>(c, i) : out.at<float>(i, c);
+        };
+
+        std::vector<RuneFanBladeWithR> results;
+        results.reserve(64);
+        for (int i = 0; i < anchors; ++i) {
+            int best_cls = -1;
+            float class_conf = 0.0f;
+            for (int c = 0; c < ModelTraits<Mode::CB5>::NUM_CLASSES; ++c) {
+                const float score = at(c, i);
+                if (std::isfinite(score) && score > class_conf) {
+                    class_conf = score;
+                    best_cls = c;
+                }
+            }
+            if (best_cls < 0 || class_conf < params_.conf_threshold)
+                continue;
+
+            std::array<cv::Point2f, ModelTraits<Mode::CB5>::NUM_POINTS> raw;
+            std::array<float, ModelTraits<Mode::CB5>::NUM_POINTS> raw_conf {};
+            int valid_kpts = 0;
+            for (int k = 0; k < ModelTraits<Mode::CB5>::NUM_POINTS; ++k) {
+                const int base = ModelTraits<Mode::CB5>::KPT_START
+                    + k * ModelTraits<Mode::CB5>::KPT_DIM;
+                const float x = at(base, i);
+                const float y = at(base + 1, i);
+                const float kconf = at(base + 2, i);
+                raw[k] = cv::Point2f(x, y);
+                raw_conf[k] = kconf;
+                if (std::isfinite(x) && std::isfinite(y) && std::isfinite(kconf)
+                    && kconf >= params_.keypoint_conf_threshold)
+                {
+                    ++valid_kpts;
+                }
+            }
+            constexpr int r_index = ModelTraits<Mode::CB5>::R_INDEX;
+            const bool r_valid = std::isfinite(raw[r_index].x)
+                && std::isfinite(raw[r_index].y)
+                && raw_conf[r_index] >= params_.keypoint_conf_threshold;
+            bool corners_valid = true;
+            for (int k: { 0, 1, 3, 4 }) {
+                corners_valid = corners_valid && std::isfinite(raw[k].x)
+                    && std::isfinite(raw[k].y)
+                    && raw_conf[k] >= params_.keypoint_conf_threshold;
+            }
+            // R 必须有效；四角也必须全部有效，否则不把无效点送入 PnP。
+            if (valid_kpts < std::clamp(params_.min_valid_kpts, 4, 5) || !r_valid
+                || !corners_valid)
+            {
+                continue;
+            }
+
+            // 官方标注顺序（实测）：
+            //   0 = 上, 1 = 左, 2 = R, 3 = 右, 4 = 下。
+            // 下游六点顺序是上/左/下/右/中/R，因此 3 与 4 需要交换。
+            RuneFanBladeWithR rune;
+            rune.geometry = RuneBladeGeometry::CARDINAL_4_R150;
+            rune.activation = static_cast<RuneActivation>(best_cls);
+            rune.confidence = class_conf;
+            rune.color = RuneColor::NONE; // 类别是激活状态，不是红蓝颜色
+            rune.raw_points = raw;
+            rune.raw_confidences = raw_conf;
+            rune.points.resize(RuneFanBladeWithR::N);
+            rune.points[RuneFanBladeWithR::TOP] = raw[0];
+            rune.points[RuneFanBladeWithR::LEFT] = raw[1];
+            rune.points[RuneFanBladeWithR::BOTTOM] = raw[4];
+            rune.points[RuneFanBladeWithR::RIGHT] = raw[3];
+            rune.points[RuneFanBladeWithR::CENTER] =
+                (raw[0] + raw[1] + raw[3] + raw[4]) * 0.25f;
+            rune.points[RuneFanBladeWithR::R] = raw[r_index];
+
+            const float min_x = std::min({ raw[0].x, raw[1].x, raw[3].x, raw[4].x });
+            const float max_x = std::max({ raw[0].x, raw[1].x, raw[3].x, raw[4].x });
+            const float min_y = std::min({ raw[0].y, raw[1].y, raw[3].y, raw[4].y });
+            const float max_y = std::max({ raw[0].y, raw[1].y, raw[3].y, raw[4].y });
+            rune.bbox = cv::Rect2f(min_x, min_y, max_x - min_x, max_y - min_y);
+            results.push_back(rune);
+        }
+        return results;
     }
 
     int input_w() const noexcept {
