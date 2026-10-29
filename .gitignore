@@ -34,6 +34,7 @@ model/at.onnx
 model/at.engine
 model/0708_sm120.engine
 model/opt-1208-001_sm120.engine
+model/model-0624_sm120.engine
 Camera
 output
 

@@ -20,16 +20,17 @@ public:
         Eigen::Matrix3f& tf_matrix,
         cudaStream_t stream
     );
-    [[nodiscard]] cv::Mat tensor_to_mat(float* d_nchw, cudaStream_t stream, bool swap_rb) const;
+    [[nodiscard]] cv::Mat tensor_to_mat(float* d_nchw, cudaStream_t stream, bool swap_rb);
     void release();
     bool is_initialized() const {
-        return d_input_bgr_ && d_nchw_ && d_input_bgr_pitched_;
+        return d_input_bgr_ && d_nchw_ && d_input_bgr_pitched_ && d_hwc_;
     }
     void check_out_enough_mem(int img_w, int img_h);
     void relloc_mem();
     unsigned char* d_input_bgr_ = nullptr;
     float* d_nchw_ = nullptr;
     unsigned char* d_input_bgr_pitched_ = nullptr;
+    uchar4* d_hwc_ = nullptr;
     size_t input_pitch_bytes_ = 0;
     NetDetectorBase::Config config_;
     int max_src_w_, max_src_h_;

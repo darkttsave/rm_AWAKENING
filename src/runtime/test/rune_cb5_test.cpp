@@ -2,20 +2,26 @@
 #include "tasks/auto_buff/rune_detect/rune_infer.hpp"
 #include "tasks/auto_buff/rune_track/rune_target.hpp"
 #include "tasks/auto_buff/type.hpp"
+#include "tasks/auto_aim/armor_detect/armor_detector.hpp"
 #include "tasks/base/common.hpp"
 #include "utils/common/image.hpp"
 #include "utils/logger.hpp"
 #include "utils/net_detector/openvino/net_detector_openvino.hpp"
+#ifdef USE_TRT
+    #include "utils/net_detector/tensorrt/net_detector_tensorrt.hpp"
+#endif
 #include "utils/utils.hpp"
 #include <algorithm>
 #include <barrier>
 #include <chrono>
+#include <cmath>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -292,6 +298,37 @@ void print_benchmark(const char* phase, const BenchSummary& result) {
               << " avg_objects=" << result.avg_objects << "\n";
 }
 
+utils::NetDetectorBase::Ptr make_net_detector(
+    const YAML::Node& detector_config,
+    const utils::NetDetectorBase::Config& net_config,
+    const std::string& backend
+) {
+    if (backend == "openvino") {
+        return std::make_unique<utils::NetDetectorOpenVINO>(
+            detector_config["net_detector"]["openvino"],
+            net_config
+        );
+    }
+#ifdef USE_TRT
+    if (backend == "tensorrt") {
+        return std::make_unique<utils::NetDetectorTensorrt>(
+            detector_config["net_detector"]["tensorrt"],
+            net_config
+        );
+    }
+#endif
+    throw std::runtime_error("unsupported benchmark backend: " + backend);
+}
+
+utils::NetDetectorBase::Config make_net_config(const RuneInfer& infer) {
+    return utils::NetDetectorBase::Config {
+        .target_format = infer.target_format(),
+        .preprocess_scale = infer.use_norm() ? 1.0 / 255.0 : 1.0,
+        .target_w = infer.input_w(),
+        .target_h = infer.input_h(),
+    };
+}
+
 int benchmark(
     const std::string& config_path,
     const std::string& image_path,
@@ -321,22 +358,14 @@ int benchmark(
               << src.rows << "\n";
 
     auto infer = RuneInfer::create(detector_config["net_detector"]["rune_infer"]);
-    auto net_config = utils::NetDetectorBase::Config {
-        .target_format = infer->target_format(),
-        .preprocess_scale = infer->use_norm() ? 1.0 / 255.0 : 1.0,
-        .target_w = infer->input_w(),
-        .target_h = infer->input_h(),
-    };
-    utils::NetDetectorOpenVINO net(
-        detector_config["net_detector"]["openvino"],
-        net_config
-    );
+    const auto backend = detector_config["backend"].as<std::string>();
+    auto net = make_net_detector(detector_config, make_net_config(*infer), backend);
 
     print_benchmark(
         "network_total",
         run_benchmark(
             [&]() {
-                const auto output = net.detect(src, PixelFormat::BGR);
+                const auto output = net->detect(src, PixelFormat::BGR);
                 return output.output.empty() ? size_t { 0 } : size_t { 1 };
             },
             concurrency,
@@ -347,7 +376,7 @@ int benchmark(
     StageSamples stage_samples;
     (void)run_benchmark(
         [&]() {
-            const auto output = net.detect(src, PixelFormat::BGR);
+            const auto output = net->detect(src, PixelFormat::BGR);
             stage_samples.add(output);
             return output.output.empty() ? size_t { 0 } : size_t { 1 };
         },
@@ -358,12 +387,12 @@ int benchmark(
     const auto inference = summarize_stage(std::move(stage_samples.inference));
     const auto output_copy = summarize_stage(std::move(stage_samples.output_copy));
     std::cout << std::fixed << std::setprecision(3)
-              << "openvino_stages preprocess_avg/p95_ms=" << preprocess.first << "/"
+              << backend << "_stages preprocess_avg/p95_ms=" << preprocess.first << "/"
               << preprocess.second << " inference_avg/p95_ms=" << inference.first << "/"
               << inference.second << " output_copy_avg/p95_ms=" << output_copy.first << "/"
               << output_copy.second << "\n";
 
-    const auto sample_output = net.detect(src, PixelFormat::BGR);
+    const auto sample_output = net->detect(src, PixelFormat::BGR);
     print_benchmark(
         "cb5_postprocess",
         run_benchmark(
@@ -392,6 +421,122 @@ int benchmark(
     );
     return 0;
 }
+
+bool all_finite(const cv::Mat& output) {
+    if (output.empty() || output.type() != CV_32F)
+        return false;
+    for (int row = 0; row < output.rows; ++row) {
+        const float* values = output.ptr<float>(row);
+        for (int col = 0; col < output.cols; ++col) {
+            if (!std::isfinite(values[col]))
+                return false;
+        }
+    }
+    return true;
+}
+
+int compare_backends(const std::string& config_path, const std::string& image_path) {
+#ifndef USE_TRT
+    std::cerr << "TensorRT support is not enabled in this build\n";
+    return 1;
+#else
+    const YAML::Node config = YAML::LoadFile(config_path);
+    const YAML::Node detector_config = config["rune_detector"];
+    cv::Mat src = cv::imread(image_path);
+    if (src.empty()) {
+        std::cerr << "cannot read image: " << image_path << "\n";
+        return 1;
+    }
+
+    auto infer = RuneInfer::create(detector_config["net_detector"]["rune_infer"]);
+    const auto net_config = make_net_config(*infer);
+    auto openvino = make_net_detector(detector_config, net_config, "openvino");
+    auto tensorrt = make_net_detector(detector_config, net_config, "tensorrt");
+
+    // Exclude one-time backend initialization from the reported stage timings.
+    (void)openvino->detect(src, PixelFormat::BGR);
+    (void)tensorrt->detect(src, PixelFormat::BGR);
+    const auto ov_output = openvino->detect(src, PixelFormat::BGR);
+    const auto trt_output = tensorrt->detect(src, PixelFormat::BGR);
+    const bool shapes_ok = ov_output.output.rows == 18 && ov_output.output.cols == 6300
+        && trt_output.output.size() == ov_output.output.size();
+    const bool finite_ok = all_finite(ov_output.output) && all_finite(trt_output.output);
+    auto ov_objects = infer->process(ov_output.output);
+    auto trt_objects = infer->process(trt_output.output);
+    bool objects_ok = ov_objects.size() == trt_objects.size();
+    bool pnp_ok = true;
+    size_t valid_pnp_count = 0;
+    float max_keypoint_delta = 0.0F;
+    CameraInfo camera_info;
+    camera_info.load(config["camera"]["camera_info"]);
+    if (objects_ok) {
+        for (size_t i = 0; i < ov_objects.size(); ++i) {
+            auto& ov = ov_objects[i];
+            auto& trt = trt_objects[i];
+            objects_ok = objects_ok && ov.activation == trt.activation
+                && ov.geometry == trt.geometry && ov.points.size() == trt.points.size();
+            if (!objects_ok)
+                break;
+            for (size_t k = 0; k < ov.points.size(); ++k) {
+                if (!std::isfinite(ov.points[k].x) || !std::isfinite(ov.points[k].y)
+                    || !std::isfinite(trt.points[k].x) || !std::isfinite(trt.points[k].y)) {
+                    objects_ok = false;
+                    break;
+                }
+                max_keypoint_delta = std::max(
+                    max_keypoint_delta,
+                    static_cast<float>(cv::norm(ov.points[k] - trt.points[k]))
+                );
+            }
+            ov.transform(ov_output.transform_matrix);
+            trt.transform(trt_output.transform_matrix);
+            RuneTarget::fan_pnp(ov, camera_info, ISO3::Identity(), true);
+            RuneTarget::fan_pnp(trt, camera_info, ISO3::Identity(), true);
+            pnp_ok = pnp_ok && ov.pose_valid == trt.pose_valid;
+            if (ov.pose_valid && trt.pose_valid) {
+                ++valid_pnp_count;
+                pnp_ok = pnp_ok && ov.pose.translation().allFinite()
+                    && trt.pose.translation().allFinite();
+            }
+        }
+    }
+    constexpr float MAX_REASONABLE_KEYPOINT_DELTA_PX = 5.0F;
+    objects_ok = objects_ok && max_keypoint_delta <= MAX_REASONABLE_KEYPOINT_DELTA_PX;
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "compare raw_shape openvino=" << ov_output.output.rows << "x"
+              << ov_output.output.cols << " tensorrt=" << trt_output.output.rows << "x"
+              << trt_output.output.cols << " finite=" << (finite_ok ? "yes" : "no") << "\n"
+              << "compare objects openvino=" << ov_objects.size() << " tensorrt="
+              << trt_objects.size() << " max_keypoint_delta_px=" << max_keypoint_delta
+              << " valid_pnp_pairs=" << valid_pnp_count << "\n"
+              << "compare timing_ms openvino(pre/infer/copy)=" << ov_output.preprocess_ms << "/"
+              << ov_output.inference_ms << "/" << ov_output.output_copy_ms
+              << " tensorrt(pre/infer/copy)=" << trt_output.preprocess_ms << "/"
+              << trt_output.inference_ms << "/" << trt_output.output_copy_ms << "\n";
+    const bool ok = shapes_ok && finite_ok && objects_ok && pnp_ok;
+    std::cout << (ok ? "COMPARE PASS" : "COMPARE FAIL") << "\n";
+    return ok ? 0 : 1;
+#endif
+}
+
+int armor_smoke_test(const std::string& config_path, const std::string& image_path) {
+    const YAML::Node config = YAML::LoadFile(config_path);
+    cv::Mat src = cv::imread(image_path);
+    if (src.empty()) {
+        std::cerr << "cannot read image: " << image_path << "\n";
+        return 1;
+    }
+    CommonFrame frame;
+    frame.img_frame.src_img = src;
+    frame.img_frame.format = PixelFormat::BGR;
+    frame.img_frame.timestamp = Clock::now();
+    auto_aim::ArmorDetector detector(config["armor_detector"]);
+    auto [lights, armors] = detector.detect(frame, cv::Rect(0, 0, src.cols, src.rows));
+    std::cout << "ARMOR_TRT_SMOKE PASS lights=" << lights.size() << " armors=" << armors.size()
+              << "\n";
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -408,9 +553,27 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (argc == 4 && std::string(argv[1]) == "--compare") {
+        try {
+            return compare_backends(argv[2], argv[3]);
+        } catch (const std::exception& e) {
+            std::cerr << "compare error: " << e.what() << "\n";
+            return 1;
+        }
+    }
+    if (argc == 4 && std::string(argv[1]) == "--armor-smoke") {
+        try {
+            return armor_smoke_test(argv[2], argv[3]);
+        } catch (const std::exception& e) {
+            std::cerr << "armor smoke error: " << e.what() << "\n";
+            return 1;
+        }
+    }
     if (argc < 3) {
         std::cerr << "usage: " << argv[0]
-                  << " <config.yaml> <image-or-dir>... [--out <dir>]\n";
+                  << " <config.yaml> <image-or-dir>... [--out <dir>]\n"
+                  << "       " << argv[0] << " --compare <config.yaml> <image>\n"
+                  << "       " << argv[0] << " --armor-smoke <config.yaml> <image>\n";
         return 1;
     }
     const std::string config_path = argv[1];

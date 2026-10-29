@@ -299,6 +299,7 @@ target_link_libraries(control_test
     ${PROJECT_NAME}_web
 )
 target_link_libraries(rune_cb5_test
+    ${PROJECT_NAME}_auto_aim
     ${PROJECT_NAME}_auto_buff
 )
 

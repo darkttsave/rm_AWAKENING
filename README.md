@@ -164,18 +164,24 @@ sudo ./bin/standard omni true
 | 自瞄 / OpenVINO | `config/daedalus_sim_openvino.yaml` | 装甲 TUP；能量机关 CB9 `cb_rune.onnx + model_type: cb` |
 | 自瞄 / TensorRT | `config/daedalus_sim_tensorrt.yaml` | 装甲 TensorRT；能量机关仍为 CB9 OpenVINO |
 | 能量机关 CB5 / OpenVINO | `config/daedalus_sim_openvino_cb5.yaml` | `model-0624.onnx + model_type: cb5`，双路 LATENCY、单 stream 基线 |
+| 能量机关 CB5 / TensorRT | `config/daedalus_sim_tensorrt_cb5.yaml` | `model-0624.onnx + model_type: cb5`，双 Context、独立 SM120 engine 缓存 |
 
-CB5 OpenVINO 仿真启动示例：
+CB5 仿真启动示例：
 
 ```bash
 LD_LIBRARY_PATH=/opt/ros/jazzy/lib \
   ./bin/standard config/daedalus_sim_openvino_cb5.yaml false
+
+# TensorRT：切换前先停止上面的 standard，避免同时写 Daedalus 共享内存
+./bin/standard config/daedalus_sim_tensorrt_cb5.yaml true
 ```
 
-线程数、stream、CPU pinning 和核心类型属于目标硬件相关参数，调整前请保留基线并重新测试；CB5 TensorRT 适配尚未在该入口中实现。
+OpenVINO 的线程、stream、CPU pinning 和核心类型，以及 TensorRT engine，均与目标硬件和运行环境有关。调整前请保留基线并重新测试；TensorRT engine 不应跨 GPU 架构或 TensorRT/CUDA 版本直接复用。
 
-CB5 OpenVINO 参数位置、验证指标和恢复方法见
-[`reminder/reminder_CB5_OpenVINO调参.md`](reminder/reminder_CB5_OpenVINO调参.md)。
+CB5 参数位置、验证指标和恢复方法见：
+
+- [`reminder/reminder_CB5_OpenVINO调参.md`](reminder/reminder_CB5_OpenVINO调参.md)
+- [`reminder/reminder_CB5_TensorRT接入与验证.md`](reminder/reminder_CB5_TensorRT接入与验证.md)
 
 ---
 

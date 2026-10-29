@@ -7,11 +7,13 @@
     #include "utils/logger.hpp"
     #include <NvOnnxParser.h>
     #include <array>
+    #include <chrono>
     #include <cuda_runtime.h>
     #include <fstream>
     #include <memory>
     #include <opencv2/core/hal/interface.h>
     #include <opencv2/highgui.hpp>
+    #include <sstream>
     #include <string>
 namespace awakening::utils {
     #define TRT_CHECK(expr) \
@@ -55,9 +57,39 @@ struct NetDetectorTensorrt::Impl {
     };
     static int64_t volume(const nvinfer1::Dims& dims) {
         int64_t v = 1;
-        for (int i = 0; i < dims.nbDims; ++i)
+        for (int i = 0; i < dims.nbDims; ++i) {
+            if (dims.d[i] <= 0)
+                throw std::runtime_error("Tensor shape is not fully specified");
             v *= dims.d[i];
+        }
         return v;
+    }
+    static bool sameDims(const nvinfer1::Dims& lhs, const nvinfer1::Dims& rhs) {
+        if (lhs.nbDims != rhs.nbDims)
+            return false;
+        for (int i = 0; i < lhs.nbDims; ++i) {
+            if (lhs.d[i] != rhs.d[i])
+                return false;
+        }
+        return true;
+    }
+    static bool hasDynamicDims(const nvinfer1::Dims& dims) {
+        for (int i = 0; i < dims.nbDims; ++i) {
+            if (dims.d[i] < 0)
+                return true;
+        }
+        return false;
+    }
+    static std::string dimsString(const nvinfer1::Dims& dims) {
+        std::ostringstream oss;
+        oss << "[";
+        for (int i = 0; i < dims.nbDims; ++i) {
+            if (i > 0)
+                oss << ",";
+            oss << dims.d[i];
+        }
+        oss << "]";
+        return oss.str();
     }
     Impl(const YAML::Node& config, Config c) {
         config_ = c;
@@ -69,23 +101,52 @@ struct NetDetectorTensorrt::Impl {
 
         if (!tmp_ctx)
             throw std::runtime_error("Failed to create execution context");
-        input_name_ = engine_->getIOTensorName(0);
-        output_name_ = engine_->getIOTensorName(1);
+        if (engine_->getNbIOTensors() != 2)
+            throw std::runtime_error("TensorRT adapter requires exactly one input and one output");
+        for (int i = 0; i < engine_->getNbIOTensors(); ++i) {
+            const char* name = engine_->getIOTensorName(i);
+            if (engine_->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
+                input_name_ = name;
+            else
+                output_name_ = name;
+        }
+        if (!input_name_ || !output_name_)
+            throw std::runtime_error("TensorRT input/output tensor discovery failed");
+        if (engine_->getTensorDataType(input_name_) != nvinfer1::DataType::kFLOAT
+            || engine_->getTensorDataType(output_name_) != nvinfer1::DataType::kFLOAT)
+            throw std::runtime_error("TensorRT adapter currently requires FP32 input/output tensors");
         input_dims_ = nvinfer1::Dims4 { 1,
                                         config_.target_format == PixelFormat::GRAY ? 1 : 3,
                                         config_.target_h,
                                         config_.target_w };
-        tmp_ctx->setInputShape(input_name_, input_dims_);
-        auto dims = tmp_ctx->getTensorShape(input_name_);
-        if (dims.nbDims == -1) {
-            throw std::runtime_error("Input shape not specified");
+        const auto engine_input_dims = engine_->getTensorShape(input_name_);
+        if (hasDynamicDims(engine_input_dims)) {
+            if (!tmp_ctx->setInputShape(input_name_, input_dims_))
+                throw std::runtime_error("Failed to set TensorRT input shape");
+        } else if (!sameDims(engine_input_dims, input_dims_)) {
+            throw std::runtime_error(
+                "TensorRT input shape mismatch: engine=" + dimsString(engine_input_dims)
+                + " requested=" + dimsString(input_dims_)
+            );
         }
-
+        auto dims = tmp_ctx->getTensorShape(input_name_);
         input_dims_ = dims;
         output_dims_ = tmp_ctx->getTensorShape(output_name_);
+        if (output_dims_.nbDims != 3 || output_dims_.d[0] != 1)
+            throw std::runtime_error(
+                "TensorRT adapter requires a three-dimensional batch-1 output, got "
+                + dimsString(output_dims_)
+            );
         tmp_ctx.reset();
         input_sz_ = volume(input_dims_);
         output_sz_ = volume(output_dims_);
+        AWAKENING_INFO(
+            "TensorRT tensors: {} {} -> {} {}",
+            input_name_,
+            dimsString(input_dims_),
+            output_name_,
+            dimsString(output_dims_)
+        );
         if (params_.copy_context_num < 1) {
             params_.copy_context_num = 1;
         }
@@ -111,7 +172,8 @@ struct NetDetectorTensorrt::Impl {
             ctx.context.reset(engine_->createExecutionContext());
             if (params_.use_cuda_preproces)
                 ctx.letter_box = std::make_shared<__cuda::LetterBox>(config_);
-            TRT_CHECK(cudaMalloc(&ctx.device_buffers[INPUT_IDX], input_sz_ * sizeof(float)));
+            if (!params_.use_cuda_preproces)
+                TRT_CHECK(cudaMalloc(&ctx.device_buffers[INPUT_IDX], input_sz_ * sizeof(float)));
             TRT_CHECK(cudaMalloc(&ctx.device_buffers[OUTPUT_IDX], output_sz_ * sizeof(float)));
             ctx.output_buffer.resize(output_sz_);
             TRT_CHECK(cudaStreamCreate(&ctx.stream));
@@ -167,21 +229,32 @@ struct NetDetectorTensorrt::Impl {
         auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
         config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 30);
+        int c = config_.target_format == PixelFormat::GRAY ? 1 : 3;
+        nvinfer1::Dims4 dims { 1, c, config_.target_h, config_.target_w };
+        if (network->getNbInputs() != 1 || network->getNbOutputs() != 1)
+            throw std::runtime_error("TensorRT adapter requires exactly one input and one output");
+        auto* input = network->getInput(0);
+        const auto model_dims = input->getDimensions();
+        if (hasDynamicDims(model_dims)) {
+            auto* profile = builder->createOptimizationProfile();
+            const char* input_name = input->getName();
+            if (!profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kMIN, dims)
+                || !profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kOPT, dims)
+                || !profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kMAX, dims)
+                || config->addOptimizationProfile(profile) < 0)
+                throw std::runtime_error("Failed to configure TensorRT optimization profile");
+        } else if (!sameDims(model_dims, dims)) {
+            throw std::runtime_error(
+                "ONNX input shape mismatch: model=" + dimsString(model_dims)
+                + " requested=" + dimsString(dims)
+            );
+        }
+
         auto serialized = std::unique_ptr<nvinfer1::IHostMemory>(
             builder->buildSerializedNetwork(*network, *config)
         );
-        auto profile = builder->createOptimizationProfile();
-
-        int c = config_.target_format == PixelFormat::GRAY ? 1 : 3;
-        nvinfer1::Dims4 dims { 1, c, config_.target_h, config_.target_w };
-
-        const char* input_name = network->getInput(0)->getName();
-
-        profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kMIN, dims);
-        profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kOPT, dims);
-        profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kMAX, dims);
-
-        config->addOptimizationProfile(profile);
+        if (!serialized)
+            throw std::runtime_error("TensorRT engine serialization failed");
 
         engine_.reset(runtime_->deserializeCudaEngine(serialized->data(), serialized->size()));
 
@@ -190,9 +263,33 @@ struct NetDetectorTensorrt::Impl {
 
         std::ofstream fout(engine_path, std::ios::binary);
         fout.write(static_cast<const char*>(serialized->data()), serialized->size());
+        if (!fout.good())
+            throw std::runtime_error("Failed to save TensorRT engine: " + engine_path);
 
         AWAKENING_INFO("Engine built & saved: {}", engine_path);
     }
+
+    struct CudaStageTimer {
+        std::array<cudaEvent_t, 4> events {};
+        CudaStageTimer() {
+            for (auto& event: events)
+                TRT_CHECK(cudaEventCreate(&event));
+        }
+        ~CudaStageTimer() {
+            for (auto event: events) {
+                if (event)
+                    cudaEventDestroy(event);
+            }
+        }
+        void record(size_t index, cudaStream_t stream) {
+            TRT_CHECK(cudaEventRecord(events[index], stream));
+        }
+        double elapsed(size_t begin, size_t end) const {
+            float ms = 0.0F;
+            TRT_CHECK(cudaEventElapsedTime(&ms, events[begin], events[end]));
+            return ms;
+        }
+    };
 
     OutPut detect(const cv::Mat& img, PixelFormat format) noexcept {
         if (img.empty()) {
@@ -200,7 +297,9 @@ struct NetDetectorTensorrt::Impl {
         }
         OutPut output;
         cv::Mat blob;
+        double cpu_preprocess_ms = 0.0;
         if (!params_.use_cuda_preproces) { // 最大化ctx利用率,该部分不需要ctx则暂时不请求c
+            const auto preprocess_start = std::chrono::steady_clock::now();
             output.resized_img =
                 utils::letterbox(img, output.transform_matrix, config_.target_w, config_.target_h);
             auto swap_rb = format != config_.target_format;
@@ -211,6 +310,10 @@ struct NetDetectorTensorrt::Impl {
                 cv::Scalar(0, 0, 0),
                 swap_rb
             );
+            cpu_preprocess_ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - preprocess_start
+            )
+                                    .count();
         }
         {
             auto r = ctx_buffers_.acquire();
@@ -218,6 +321,8 @@ struct NetDetectorTensorrt::Impl {
                 return output;
             }
             auto& ctx = *r;
+            CudaStageTimer timer;
+            timer.record(0, ctx.stream);
             if (params_.use_cuda_preproces) {
                 auto tensor = ctx.letter_box->letterbox_pitched(
                     img.data,
@@ -246,6 +351,7 @@ struct NetDetectorTensorrt::Impl {
                     ctx.stream
                 ));
             }
+            timer.record(1, ctx.stream);
 
             ctx.context->setTensorAddress(input_name_, ctx.device_buffers[INPUT_IDX]);
             ctx.context->setTensorAddress(output_name_, ctx.device_buffers[OUTPUT_IDX]);
@@ -254,6 +360,7 @@ struct NetDetectorTensorrt::Impl {
                 AWAKENING_ERROR("enqueueV3 failed");
                 return output;
             }
+            timer.record(2, ctx.stream);
 
             TRT_CHECK(cudaMemcpyAsync(
                 ctx.output_buffer.data(),
@@ -262,8 +369,12 @@ struct NetDetectorTensorrt::Impl {
                 cudaMemcpyDeviceToHost,
                 ctx.stream
             ));
+            timer.record(3, ctx.stream);
 
-            cudaStreamSynchronize(ctx.stream);
+            TRT_CHECK(cudaEventSynchronize(timer.events[3]));
+            output.preprocess_ms = cpu_preprocess_ms + timer.elapsed(0, 1);
+            output.inference_ms = timer.elapsed(1, 2);
+            output.output_copy_ms = timer.elapsed(2, 3);
 
             output.output =
                 cv::Mat(output_dims_.d[1], output_dims_.d[2], CV_32F, ctx.output_buffer.data())

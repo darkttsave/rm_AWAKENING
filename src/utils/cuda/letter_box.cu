@@ -13,6 +13,7 @@ LetterBox::LetterBox(NetDetectorBase::Config config) {
     d_input_bgr_ = nullptr;
     d_input_bgr_pitched_ = nullptr;
     d_nchw_ = nullptr;
+    d_hwc_ = nullptr;
     input_pitch_bytes_ = 0;
     relloc_mem();
 }
@@ -32,6 +33,7 @@ void LetterBox::relloc_mem() {
         max_src_h_
     ));
     CUDA_CHECK(cudaMalloc(&d_nchw_, config_.target_w * config_.target_h * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_hwc_, config_.target_w * config_.target_h * sizeof(uchar4)));
 
     printf("Realloc memory for CudaInfer\n");
 }
@@ -68,23 +70,14 @@ __global__ void nchw_float_to_hwc_uchar4(
     }
 }
 
-cv::Mat LetterBox::tensor_to_mat(float* d_nchw, cudaStream_t stream, bool swap_rb) const {
-    static uchar4* d_hwc = nullptr;
-    static size_t cap = 0;
+cv::Mat LetterBox::tensor_to_mat(float* d_nchw, cudaStream_t stream, bool swap_rb) {
     const size_t need = config_.target_w * config_.target_h * sizeof(uchar4);
-
-    if (cap < need) {
-        if (d_hwc)
-            cudaFree(d_hwc);
-        cudaMalloc(&d_hwc, need);
-        cap = need;
-    }
 
     const int GRID_SIZE = (config_.target_w * config_.target_h + BLOCK_SIZE - 1) / BLOCK_SIZE;
     if (swap_rb) {
         nchw_float_to_hwc_uchar4<true, PIX_PER_THREAD><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
             d_nchw,
-            d_hwc,
+            d_hwc_,
             config_.target_w,
             config_.target_h,
             config_.preprocess_scale
@@ -92,7 +85,7 @@ cv::Mat LetterBox::tensor_to_mat(float* d_nchw, cudaStream_t stream, bool swap_r
     } else {
         nchw_float_to_hwc_uchar4<false, PIX_PER_THREAD><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
             d_nchw,
-            d_hwc,
+            d_hwc_,
             config_.target_w,
             config_.target_h,
             config_.preprocess_scale
@@ -100,7 +93,7 @@ cv::Mat LetterBox::tensor_to_mat(float* d_nchw, cudaStream_t stream, bool swap_r
     }
 
     cv::Mat img(config_.target_h, config_.target_w, CV_8UC4);
-    cudaMemcpyAsync(img.data, d_hwc, need, cudaMemcpyDeviceToHost, stream);
+    CUDA_CHECK(cudaMemcpyAsync(img.data, d_hwc_, need, cudaMemcpyDeviceToHost, stream));
     return img;
 }
 void LetterBox::check_out_enough_mem(int img_w, int img_h) {
@@ -123,6 +116,10 @@ void LetterBox::release() {
     if (d_nchw_) {
         cudaFree(d_nchw_);
         d_nchw_ = nullptr;
+    }
+    if (d_hwc_) {
+        cudaFree(d_hwc_);
+        d_hwc_ = nullptr;
     }
     input_pitch_bytes_ = 0;
 }
