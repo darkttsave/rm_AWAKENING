@@ -288,6 +288,7 @@ add_common_executable(standard src/runtime/standard.cpp)
 add_tool_executable(control_test src/runtime/test/control_test.cpp)
 add_tool_executable(delay_test src/runtime/test/delay_test.cpp)
 add_tool_executable(rune_cb5_test src/runtime/test/rune_cb5_test.cpp)
+add_tool_executable(rune_downstream_test src/runtime/test/rune_downstream_test.cpp)
 
 
 target_link_libraries(standard
@@ -300,6 +301,9 @@ target_link_libraries(control_test
 )
 target_link_libraries(rune_cb5_test
     ${PROJECT_NAME}_auto_aim
+    ${PROJECT_NAME}_auto_buff
+)
+target_link_libraries(rune_downstream_test
     ${PROJECT_NAME}_auto_buff
 )
 

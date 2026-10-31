@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -81,7 +82,8 @@ void process_image(
     for (auto& fan: detection.fan_blades) {
         std::cout << "  [" << idx++ << "] activation=" << rune_activation_name(fan.activation)
                   << " conf=" << fan.confidence
-                  << " geometry=" << (fan.geometry == RuneBladeGeometry::CARDINAL_4_R150 ? "CB5" : "CB9")
+                  << " geometry="
+                  << (fan.geometry == RuneBladeGeometry::CB5_EDGE_CENTERS_R150 ? "CB5" : "CB9")
                   << " raw:";
         for (int k = 0; k < 5; ++k) {
             std::cout << " p" << k << "=(" << fan.raw_points[k].x << "," << fan.raw_points[k].y
@@ -187,11 +189,12 @@ bool self_test() {
     };
     set_anchor(0, 1, 0.9f, 100.0f, 100.0f);
     set_anchor(1, 2, 0.8f, 400.0f, 400.0f);
-    auto dets = infer->process(out);
+    RuneInferDiagnostics diagnostics;
+    auto dets = infer->process(out, &diagnostics);
     bool ok = dets.size() == 2;
     if (ok) {
         ok = dets[0].activation == RuneActivation::SMALL_ACTIVATED
-            && dets[0].geometry == RuneBladeGeometry::CARDINAL_4_R150
+            && dets[0].geometry == RuneBladeGeometry::CB5_EDGE_CENTERS_R150
             && dets[0].points.size() == 6
             && dets[0].points[RuneFanBladeWithR::R].x == 120.0f
             && dets[0].points[RuneFanBladeWithR::TOP].x == 100.0f
@@ -202,9 +205,57 @@ bool self_test() {
     if (ok) {
         ok = dets[1].activation == RuneActivation::BIG_ACTIVATED;
     }
+    // min_valid_kpts=4 does not currently permit a missing R: the extra strict rule makes
+    // this an effective five-keypoint requirement.  Keep the behavior visible in the test.
+    cv::Mat missing_r = cv::Mat::zeros(18, 1, CV_32F);
+    auto set_missing_r = [&](int cls, float class_conf, float x0, float y0) {
+        missing_r.at<float>(cls, 0) = class_conf;
+        for (int k = 0; k < 5; ++k) {
+            const int base = 3 + k * 3;
+            missing_r.at<float>(base, 0) = x0 + k * 10.0f;
+            missing_r.at<float>(base + 1, 0) = y0 + k * 5.0f;
+            missing_r.at<float>(base + 2, 0) = k == 2 ? 0.2f : 0.95f;
+        }
+    };
+    set_missing_r(0, 0.9f, 100.0f, 100.0f);
+    RuneInferDiagnostics missing_r_diagnostics;
+    ok = ok && infer->process(missing_r, &missing_r_diagnostics).empty()
+        && missing_r_diagnostics.rejected_by_configured_min == 0
+        && missing_r_diagnostics.rejected_invalid_r == 1
+        && missing_r_diagnostics.rejected_by_aw_strict_rule == 1;
     // 输出通道不足时必须安全返回空结果，而不是抛异常/越界。
     cv::Mat bad = cv::Mat::zeros(10, 3, CV_32F);
     ok = ok && infer->process(bad).empty();
+
+    // Projection -> PnP regression for the exact CB5 order 0/1/4/3/2(R).
+    // This also ensures the synthetic arithmetic CENTER never becomes a sixth constraint.
+    const cv::Mat camera_matrix =
+        (cv::Mat_<double>(3, 3) << 1200.0, 0.0, 720.0, 0.0, 1200.0, 540.0, 0.0, 0.0, 1.0);
+    const cv::Mat distortion = cv::Mat::zeros(1, 5, CV_64F);
+    const cv::Mat rvec = (cv::Mat_<double>(3, 1) << 0.10, -0.20, 0.05);
+    const cv::Mat tvec = (cv::Mat_<double>(3, 1) << 0.20, -0.10, 6.00);
+    const auto object_points =
+        RuneFanBladeWithR::Point3DRZERO<cv::Point3f>::build_cb5_five_points();
+    std::vector<cv::Point2f> projected;
+    cv::projectPoints(object_points, rvec, tvec, camera_matrix, distortion, projected);
+    RuneFanBladeWithR projected_fan;
+    projected_fan.geometry = RuneBladeGeometry::CB5_EDGE_CENTERS_R150;
+    projected_fan.points.resize(RuneFanBladeWithR::N);
+    projected_fan.points[RuneFanBladeWithR::TOP] = projected[0];
+    projected_fan.points[RuneFanBladeWithR::LEFT] = projected[1];
+    projected_fan.points[RuneFanBladeWithR::BOTTOM] = projected[2];
+    projected_fan.points[RuneFanBladeWithR::RIGHT] = projected[3];
+    projected_fan.points[RuneFanBladeWithR::CENTER] = cv::Point2f(-1000.0F, -1000.0F);
+    projected_fan.points[RuneFanBladeWithR::R] = projected[4];
+    RuneTarget::fan_pnp(
+        projected_fan,
+        CameraInfo { .camera_matrix = camera_matrix, .distortion_coefficients = distortion },
+        ISO3::Identity(),
+        true
+    );
+    ok = ok && projected_fan.pose_valid
+        && (projected_fan.pose.translation() - Vec3(0.20, -0.10, 6.00)).norm() < 1e-4
+        && projected_fan.reprojection_error_px < 1e-3;
     std::cout << (ok ? "SELF_TEST PASS" : "SELF_TEST FAIL") << "\n";
     return ok;
 }
@@ -461,12 +512,21 @@ int compare_backends(const std::string& config_path, const std::string& image_pa
     const bool shapes_ok = ov_output.output.rows == 18 && ov_output.output.cols == 6300
         && trt_output.output.size() == ov_output.output.size();
     const bool finite_ok = all_finite(ov_output.output) && all_finite(trt_output.output);
+    double raw_mean_abs_delta = std::numeric_limits<double>::quiet_NaN();
+    double raw_max_abs_delta = std::numeric_limits<double>::quiet_NaN();
+    if (shapes_ok && finite_ok) {
+        cv::Mat raw_abs_delta;
+        cv::absdiff(ov_output.output, trt_output.output, raw_abs_delta);
+        raw_mean_abs_delta = cv::mean(raw_abs_delta)[0];
+        cv::minMaxLoc(raw_abs_delta, nullptr, &raw_max_abs_delta);
+    }
     auto ov_objects = infer->process(ov_output.output);
     auto trt_objects = infer->process(trt_output.output);
     bool objects_ok = ov_objects.size() == trt_objects.size();
     bool pnp_ok = true;
     size_t valid_pnp_count = 0;
     float max_keypoint_delta = 0.0F;
+    float max_confidence_delta = 0.0F;
     CameraInfo camera_info;
     camera_info.load(config["camera"]["camera_info"]);
     if (objects_ok) {
@@ -475,6 +535,11 @@ int compare_backends(const std::string& config_path, const std::string& image_pa
             auto& trt = trt_objects[i];
             objects_ok = objects_ok && ov.activation == trt.activation
                 && ov.geometry == trt.geometry && ov.points.size() == trt.points.size();
+            max_confidence_delta =
+                std::max(
+                    max_confidence_delta,
+                    static_cast<float>(std::abs(ov.confidence - trt.confidence))
+                );
             if (!objects_ok)
                 break;
             for (size_t k = 0; k < ov.points.size(); ++k) {
@@ -506,9 +571,12 @@ int compare_backends(const std::string& config_path, const std::string& image_pa
     std::cout << std::fixed << std::setprecision(3)
               << "compare raw_shape openvino=" << ov_output.output.rows << "x"
               << ov_output.output.cols << " tensorrt=" << trt_output.output.rows << "x"
-              << trt_output.output.cols << " finite=" << (finite_ok ? "yes" : "no") << "\n"
+              << trt_output.output.cols << " finite=" << (finite_ok ? "yes" : "no")
+              << " mean_abs_delta=" << raw_mean_abs_delta
+              << " max_abs_delta=" << raw_max_abs_delta << "\n"
               << "compare objects openvino=" << ov_objects.size() << " tensorrt="
               << trt_objects.size() << " max_keypoint_delta_px=" << max_keypoint_delta
+              << " max_confidence_delta=" << max_confidence_delta
               << " valid_pnp_pairs=" << valid_pnp_count << "\n"
               << "compare timing_ms openvino(pre/infer/copy)=" << ov_output.preprocess_ms << "/"
               << ov_output.inference_ms << "/" << ov_output.output_copy_ms
