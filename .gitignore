@@ -1,5 +1,6 @@
 build
 build-trt/
+/build-szu-rune-contract/
 
 devel
 
@@ -39,3 +40,4 @@ Camera
 output
 
 /ai_workspace
+/.task_snapshots/
