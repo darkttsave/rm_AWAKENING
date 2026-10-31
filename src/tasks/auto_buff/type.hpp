@@ -3,6 +3,7 @@
 #include "utils/common/type_common.hpp"
 #include "utils/utils.hpp"
 #include <array>
+#include <limits>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 #include <opencv2/imgproc.hpp>
@@ -11,8 +12,10 @@
 namespace awakening::auto_buff {
 constexpr double RUNE_FAN_TARGET_BOX_DIS_HALF = 0.15 / 2.0;
 constexpr double RUNE_FAN_TARGET_R = 0.115;
-// SZU model-0624 的四个关键点在靶面圆周上，半径实测约 0.15m。
-constexpr double CB5_FAN_TARGET_R = 0.15;
+// SZU CB5 labels 0/1/4/3 at the four protruding edge centres of the circular target.
+// Daedalus POWER.glb has a 0.300 m target diameter, so these points are 0.150 m
+// from the target centre.  They are not the corners of the legacy 0.150 m CB9 box.
+constexpr double CB5_FAN_TARGET_EDGE_RADIUS = 0.15;
 constexpr double RUNE_R2_FAN_TARGET_CENTER = 0.70;
 constexpr double FUCK = 0.015;
 constexpr int FAN_NUM = 5;
@@ -40,10 +43,9 @@ inline const char* rune_activation_name(RuneActivation activation) noexcept {
             return "unknown";
     }
 }
-// CB9 与 CB5 都输出靶面圆周上的上/左/下/右四点，但半径不同。
 enum class RuneBladeGeometry : int {
     CARDINAL_4 = 0, // CB9: r = 0.115m
-    CARDINAL_4_R150 = 1, // CB5: r = 0.15m
+    CB5_EDGE_CENTERS_R150 = 1,
 };
 
 struct RuneFanBladeWithR {
@@ -53,14 +55,15 @@ struct RuneFanBladeWithR {
         inline static std::vector<PointT> build(
             RuneBladeGeometry geometry = RuneBladeGeometry::CARDINAL_4
         ) {
-            if (geometry == RuneBladeGeometry::CARDINAL_4_R150) {
-                // CB5: model-0624 的 0/1/3/4 分别是上/左/右/下，R 为 2。
-                // 四点在同一靶面圆周上，实测半径约 0.15m。
+            if (geometry == RuneBladeGeometry::CB5_EDGE_CENTERS_R150) {
+                // Raw order 0/1/4/3 is outer-radial/left-tangential/inner-radial/
+                // right-tangential.  The target centre follows at index 4 for legacy
+                // consumers; it is synthetic and must not be added to CB5 solvePnP.
                 return {
-                    PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER + CB5_FAN_TARGET_R), // TOP
-                    PointT(0, CB5_FAN_TARGET_R, RUNE_R2_FAN_TARGET_CENTER), // LEFT
-                    PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER - CB5_FAN_TARGET_R), // BOTTOM
-                    PointT(0, -CB5_FAN_TARGET_R, RUNE_R2_FAN_TARGET_CENTER), // RIGHT
+                    PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER + CB5_FAN_TARGET_EDGE_RADIUS),
+                    PointT(0, CB5_FAN_TARGET_EDGE_RADIUS, RUNE_R2_FAN_TARGET_CENTER),
+                    PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER - CB5_FAN_TARGET_EDGE_RADIUS),
+                    PointT(0, -CB5_FAN_TARGET_EDGE_RADIUS, RUNE_R2_FAN_TARGET_CENTER),
                     PointT(0, 0, RUNE_R2_FAN_TARGET_CENTER), // 中
                     PointT(0, 0, 0),
                 };
@@ -80,6 +83,10 @@ struct RuneFanBladeWithR {
             auto points = build(geometry);
             points.pop_back();
             return points;
+        }
+        inline static std::vector<PointT> build_cb5_five_points() {
+            const auto points = build(RuneBladeGeometry::CB5_EDGE_CENTERS_R150);
+            return { points[TOP], points[LEFT], points[BOTTOM], points[RIGHT], points[R] };
         }
     };
     template<typename PointT>
@@ -111,6 +118,22 @@ struct RuneFanBladeWithR {
     std::array<cv::Point2f, 5> raw_points {};
     std::array<float, 5> raw_confidences {};
     ISO3 pose = ISO3::Identity();
+    // Diagnostics only: solvePnP result before camera_cv -> odom and its fit quality.
+    ISO3 pose_camera_cv = ISO3::Identity();
+    double reprojection_error_px = std::numeric_limits<double>::quiet_NaN();
+    Vec3 tracker_predicted_position = Vec3::Constant(
+        std::numeric_limits<double>::quiet_NaN()
+    );
+    int match_best_id = -1;
+    int match_id = -1;
+    double match_best_d2 = std::numeric_limits<double>::quiet_NaN();
+    std::array<double, 5> match_residual_ypd_rotation {
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::quiet_NaN(),
+    };
     cv::Rect2f bbox;
     RuneColor color = RuneColor::NONE;
     RuneActivation activation = RuneActivation::UNKNOWN;
@@ -140,6 +163,36 @@ struct RuneFanBladeWithR {
         }
         bbox = utils::transform_rect(transform_matrix, bbox);
     }
+};
+
+struct RuneInferCandidateDiagnostics {
+    int anchor = -1;
+    int class_id = -1;
+    float class_confidence = 0.0F;
+    std::array<cv::Point2f, 5> raw_points {};
+    std::array<float, 5> keypoint_confidences {};
+    int valid_keypoints = 0;
+    bool rejected_by_configured_min = false;
+    bool rejected_invalid_r = false;
+    bool rejected_invalid_cardinal = false;
+    bool accepted_by_aw = false;
+    bool accepted_by_original_policy = false;
+};
+
+struct RuneInferDiagnostics {
+    int raw_anchors = 0;
+    int class_candidates = 0;
+    int rejected_by_configured_min = 0;
+    int rejected_invalid_r = 0;
+    int rejected_invalid_cardinal = 0;
+    int rejected_by_aw_strict_rule = 0;
+    int aw_before_nms = 0;
+    int aw_after_nms = 0;
+    int original_before_nms = 0;
+    int original_after_nms = 0;
+    float keypoint_conf_threshold = 0.0F;
+    int configured_min_valid_keypoints = 0;
+    std::vector<RuneInferCandidateDiagnostics> candidates;
 };
 struct RuneR {
     cv::RotatedRect rr;
@@ -342,6 +395,7 @@ struct RuneDetection {
     TimePoint timestamp;
     int id = -1;
     int frame_id = -1;
+    RuneInferDiagnostics infer_diagnostics;
 
     std::vector<RuneFanBladeWithR> fan_blades;
     std::vector<RuneR> rune_rs;

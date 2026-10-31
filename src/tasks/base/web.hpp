@@ -22,6 +22,23 @@
     #include "_rerun/recorder.hpp"
 #endif
 namespace awakening {
+inline constexpr uint32_t AWAKENING_FRAME_SHM_MAGIC = 0x57414B45; // "WAKE"
+inline constexpr uint16_t AWAKENING_FRAME_SHM_VERSION = 1;
+struct AwakeningFrameShmHeader {
+    uint32_t magic = AWAKENING_FRAME_SHM_MAGIC;
+    uint16_t version = AWAKENING_FRAME_SHM_VERSION;
+    uint16_t header_size = 64;
+    uint64_t generation = 0; // odd while the payload is being replaced
+    uint32_t jpeg_size = 0;
+    uint32_t reserved = 0;
+    uint64_t cache_sequence = 0;
+    uint64_t capture_sequence = 0;
+    uint64_t detector_sequence = 0;
+    int64_t capture_timestamp_ns = 0;
+    int64_t cache_timestamp_ns = 0;
+};
+static_assert(sizeof(AwakeningFrameShmHeader) == 64);
+
 struct VisionDebugCtx {
     CameraInfo camera_info_; // 基本不变数据，无锁
 
@@ -51,7 +68,7 @@ public:
     AWAKENING_IMPL_DEFINITION(Web);
     void draw(cv::Mat& img, const VisionDebugCtx& ctx);
     void write_debug_data(const VisionDebugCtx& ctx);
-    void write_shm(const cv::Mat& img);
+    uint64_t write_shm(const cv::Mat& img, const ImageFrame& frame);
     static void write_shm_to(const cv::Mat& img, const char* shm_name);
     struct LogBuffer {
         std::mutex mtx;

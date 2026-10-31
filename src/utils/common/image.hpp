@@ -16,8 +16,20 @@ struct ImageFrame {
     cv::Mat src_img;
     PixelFormat format;
     TimePoint timestamp;
+    // Optional producer-side sequence number.  Cameras that do not expose one leave it at 0.
+    uint64_t source_sequence = 0;
+    // Set when the frame passes through the detector task and enters the debug-image cache.
+    uint64_t detector_sequence = 0;
+    TimePoint debug_cache_timestamp {};
     ImageFrame clone() const {
-        return ImageFrame { src_img.clone(), format, timestamp };
+        return ImageFrame {
+            src_img.clone(),
+            format,
+            timestamp,
+            source_sequence,
+            detector_sequence,
+            debug_cache_timestamp,
+        };
     }
     std::vector<uint8_t> serialize(int quality = 55) const {
         std::vector<uint8_t> buffer;

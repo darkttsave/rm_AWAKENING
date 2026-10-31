@@ -16,6 +16,7 @@
 #include <opencv2/core/types.hpp>
 #include <optional>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 namespace awakening::auto_buff {
 using namespace motion_model;
@@ -88,8 +89,13 @@ namespace {
         auto pred_state = target.get_target_state();
         pred_state.predict(timestamp, target.voter);
         for (int obs = 0; obs < n_obs; ++obs) {
+            if constexpr (std::is_same_v<Fan, RuneFanBladeWithR>) {
+                fans[obs].tracker_predicted_position = pred_state.pos();
+            }
             bool in_gate = false;
             double min_d2 = std::numeric_limits<double>::max();
+            int min_id = -1;
+            YPDVecZ min_nu = YPDVecZ::Zero();
             for (int id = 0; id < FAN_NUM; ++id) {
                 YPDMeasure measure { .ctx = { .id = id } };
                 YPDVecZ z_pred;
@@ -107,14 +113,42 @@ namespace {
                     cost[obs][id] = d2;
                     in_gate = true;
                 }
-                min_d2 = std::min(min_d2, d2);
+                if (d2 < min_d2) {
+                    min_d2 = d2;
+                    min_id = id;
+                    min_nu = nu;
+                }
             }
             if (!in_gate) {
-                AWAKENING_WARN("match out of gate min d2: {}", min_d2);
+                AWAKENING_WARN(
+                    "match out of gate min d2: {} id: {} "
+                    "nu(yaw,pitch,dist,rot_yaw,rot_roll): [{},{},{},{},{}]",
+                    min_d2,
+                    min_id,
+                    min_nu[idx::YPD_Y],
+                    min_nu[idx::YPD_P],
+                    min_nu[idx::YPD_D],
+                    min_nu[idx::ROT_YAW],
+                    min_nu[idx::ROT_ROLL]
+                );
+            }
+            if constexpr (std::is_same_v<Fan, RuneFanBladeWithR>) {
+                fans[obs].match_best_id = min_id;
+                fans[obs].match_best_d2 = min_d2;
+                fans[obs].match_residual_ypd_rotation = {
+                    min_nu[idx::YPD_Y],
+                    min_nu[idx::YPD_P],
+                    min_nu[idx::YPD_D],
+                    min_nu[idx::ROT_YAW],
+                    min_nu[idx::ROT_ROLL],
+                };
             }
         }
 
         for (auto [obs, id]: dta_utils::greedy_match(cost, n_obs, FAN_NUM, MAX_COST)) {
+            if constexpr (std::is_same_v<Fan, RuneFanBladeWithR>) {
+                fans[obs].match_id = id;
+            }
             result.emplace_back(id, fans[obs]);
         }
         return result;
@@ -263,6 +297,7 @@ void RuneTarget::fan_pnp(
     bool in_r
 ) noexcept {
     r.pose_valid = false;
+    r.reprojection_error_px = std::numeric_limits<double>::quiet_NaN();
     if (r.points.size() != RuneFanBladeWithR::N) {
         return;
     }
@@ -274,7 +309,20 @@ void RuneTarget::fan_pnp(
     try {
         auto key_points = r.points;
         std::vector<cv::Point3f> object_points;
-        if (in_r) {
+        if (in_r && r.geometry == RuneBladeGeometry::CB5_EDGE_CENTERS_R150) {
+            // CB5 is a five-point model.  CENTER is only the arithmetic mean of the
+            // four network points; under perspective it is not an independent image
+            // observation, so feeding it to solvePnP adds a biased sixth constraint.
+            key_points = {
+                r.points[RuneFanBladeWithR::TOP],
+                r.points[RuneFanBladeWithR::LEFT],
+                r.points[RuneFanBladeWithR::BOTTOM],
+                r.points[RuneFanBladeWithR::RIGHT],
+                r.points[RuneFanBladeWithR::R],
+            };
+            object_points =
+                RuneFanBladeWithR::Point3DRZERO<cv::Point3f>::build_cb5_five_points();
+        } else if (in_r) {
             object_points = RuneFanBladeWithR::Point3DRZERO<cv::Point3f>::build(r.geometry);
         } else {
             object_points =
@@ -283,8 +331,8 @@ void RuneTarget::fan_pnp(
         if (key_points.size() != object_points.size()) {
             return;
         }
-        // CB5 的 R 点由模型直接给出，参与 PnP 可消除平面靶标的 z 轴二义性；
-        // 若只用四角，投影出的 R 可能落在靶心另一侧。
+        // CB5 的 R 点是第五个真实观测。所有点仍共面，因此不能仅凭较小的
+        // 重投影误差宣称消除了平面 PnP 二义性。
         auto pose = utils::solve_pnp(
             key_points,
             object_points,
@@ -309,9 +357,13 @@ void RuneTarget::fan_pnp(
         for (size_t i = 0; i < reproj.size(); ++i) {
             reproj_sum += cv::norm(reproj[i] - key_points[i]);
         }
-        if (reproj.empty() || reproj_sum / static_cast<double>(reproj.size()) > 8.0) {
+        if (reproj.empty()) {
             return;
         }
+        r.reprojection_error_px = reproj_sum / static_cast<double>(reproj.size());
+        r.pose_camera_cv = pose;
+        if (r.reprojection_error_px > 8.0)
+            return;
         r.pose = camera_cv_in_odom * pose;
         r.pose_valid = r.pose.matrix().allFinite();
     } catch (const cv::Exception& e) {

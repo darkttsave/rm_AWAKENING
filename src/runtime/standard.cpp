@@ -1,6 +1,7 @@
 #include "angles.h"
 #include "ascii_banner.hpp"
 #include "daedalus_interface/shm_layout.hpp"
+#include "runtime/daedalus_frame_sync.hpp"
 #include "tasks/auto_aim/armor_track/motion_model.hpp"
 #include "tasks/auto_buff/rune_control/rune_aimer.hpp"
 #include "tasks/auto_buff/rune_detect/rune_detector.hpp"
@@ -16,11 +17,17 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <opencv2/highgui.hpp>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -104,6 +111,9 @@ struct TimedRuneDetection {
     bool detected = false;
     TimePoint detector_start {};
     TimePoint detector_end {};
+    cv::Rect focus;
+    bool full_frame = true;
+    uint64_t source_sequence = 0;
 };
 struct Detection {
     std::optional<std::vector<auto_aim::Armors>> armors;
@@ -134,6 +144,18 @@ struct Cb5PerfSample {
     double queue_wait_ms = 0.0;
     double tracker_ms = 0.0;
     double total_ms = 0.0;
+    cv::Rect focus;
+    bool full_frame = true;
+    int fan_blades = 0;
+    int pose_valid_fan_blades = 0;
+    int valid_matches = 0;
+    bool initialized = false;
+    auto_buff::RuneTarget::TrackState::State tracker_state =
+        auto_buff::RuneTarget::TrackState::LOST;
+    int clock_wise_count = 0;
+    int double_detect_count = 0;
+    int voter_state = auto_buff::motion_model::Voter::Collecting;
+    int voter_mode = auto_buff::motion_model::Voter::Small;
 };
 struct Cb5PerfCtx {
     void add(Cb5PerfSample sample) {
@@ -148,6 +170,82 @@ struct Cb5PerfCtx {
     }
     std::mutex mutex;
     std::vector<Cb5PerfSample> samples;
+};
+
+struct Cb5Capture {
+    explicit Cb5Capture(std::filesystem::path root, int frame_limit):
+        root(std::move(root)), frame_limit(frame_limit) {
+        std::filesystem::create_directories(this->root / "images");
+        frames.open(this->root / "frames.csv");
+        candidates.open(this->root / "candidates.csv");
+        fans.open(this->root / "fans.csv");
+        ground_truth.open(this->root / "ground_truth.csv");
+        frames
+            << "frame_id,source_seq,image_timestamp_ns,detected,raw_anchors,class_candidates,"
+               "reject_min_valid,reject_invalid_r,reject_invalid_cardinal,reject_aw_strict,"
+               "aw_before_nms,aw_after_nms,original_before_nms,original_after_nms,final_fans,"
+               "pose_sync_exact,camera_pose_seq,camera_pose_timestamp_ns,gimbal_pose_seq,"
+               "gimbal_pose_timestamp_ns,odom_pose_seq,odom_pose_timestamp_ns,muzzle_pose_seq,"
+               "muzzle_pose_timestamp_ns,camera_odom_x,camera_odom_y,camera_odom_z,"
+               "camera_odom_qw,camera_odom_qx,camera_odom_qy,camera_odom_qz,"
+               "camera_fx,camera_fy,camera_cx,camera_cy,camera_d0,camera_d1,camera_d2,"
+               "camera_d3,camera_d4,image_width,image_height,"
+               "tracker_x,tracker_y,tracker_z,tracker_state,valid_matches\n";
+        candidates
+            << "frame_id,source_seq,anchor,class_id,class_confidence,valid_keypoints,"
+               "reject_min_valid,reject_invalid_r,reject_invalid_cardinal,accepted_aw,"
+               "accepted_original,p0_x,p0_y,p0_conf,p1_x,p1_y,p1_conf,p2_x,p2_y,p2_conf,"
+               "p3_x,p3_y,p3_conf,p4_x,p4_y,p4_conf\n";
+        ground_truth
+            << "frame_id,source_seq,image_timestamp_ns,gt_present,gt_sync_exact,gt_batch_seq,"
+               "gt_batch_timestamp_ns,rune_index,rune_frame_seq,rune_timestamp_ns,team,"
+               "rune_mode,mechanism_state,r_center_odom_x,r_center_odom_y,r_center_odom_z,"
+               "radius,current_angle,v_roll,direction,sin_amplitude,sin_omega,sin_phase,"
+               "sin_offset,relative_time,blade_id,target_0,target_1,target_2,target_3,"
+               "target_4\n";
+        fans
+            << "frame_id,source_seq,fan_index,activation,class_confidence,pose_valid,"
+               "reprojection_error_px,camera_x,camera_y,camera_z,odom_x,odom_y,odom_z,"
+               "predicted_x,predicted_y,predicted_z,best_blade_id,matched_blade_id,best_d2,"
+               "residual_yaw,residual_pitch,residual_distance,residual_rot_yaw,"
+               "residual_rot_roll,p0_x,p0_y,p0_conf,p1_x,p1_y,p1_conf,p2_x,p2_y,p2_conf,"
+               "p3_x,p3_y,p3_conf,p4_x,p4_y,p4_conf\n";
+        frames << std::setprecision(17);
+        candidates << std::setprecision(9);
+        fans << std::setprecision(17);
+        ground_truth << std::setprecision(17);
+    }
+
+    bool includes(int frame_id) const noexcept {
+        return frame_id >= 0 && frame_id < frame_limit;
+    }
+
+    void record_ground_truth(const talos::ipc::GroundTruthBatch& batch) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ground_truth_by_sequence[batch.frame_seq] = batch;
+        const auto max_entries = static_cast<size_t>(std::max(frame_limit * 4, 64));
+        while (ground_truth_by_sequence.size() > max_entries) {
+            ground_truth_by_sequence.erase(ground_truth_by_sequence.begin());
+        }
+    }
+
+    std::optional<talos::ipc::GroundTruthBatch> ground_truth_for(uint64_t source_sequence) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = ground_truth_by_sequence.find(source_sequence);
+        if (found == ground_truth_by_sequence.end()) {
+            return std::nullopt;
+        }
+        return found->second;
+    }
+
+    std::filesystem::path root;
+    int frame_limit;
+    std::ofstream frames;
+    std::ofstream candidates;
+    std::ofstream fans;
+    std::ofstream ground_truth;
+    std::map<uint64_t, talos::ipc::GroundTruthBatch> ground_truth_by_sequence;
+    std::mutex mutex;
 };
 
 template<typename Member>
@@ -225,6 +323,33 @@ int main(int argc, char** argv) {
         debug = second_arg.value() == "true";
     }
     auto config = YAML::LoadFile(config_path);
+    const auto rune_debug_config = config["rune_detector"]["debug"];
+    const bool rune_force_full_frame =
+        rune_debug_config && rune_debug_config["force_full_frame"]
+        && rune_debug_config["force_full_frame"].as<bool>();
+    const bool rune_log_diagnostics =
+        rune_debug_config && rune_debug_config["log_diagnostics"]
+        && rune_debug_config["log_diagnostics"].as<bool>();
+    std::unique_ptr<Cb5Capture> cb5_capture;
+    if (const char* capture_dir = std::getenv("AW_CB5_CAPTURE_DIR")) {
+        int capture_limit = 180;
+        if (const char* limit = std::getenv("AW_CB5_CAPTURE_LIMIT")) {
+            try {
+                capture_limit = std::max(0, std::stoi(limit));
+            } catch (const std::exception&) {
+                AWAKENING_WARN("invalid AW_CB5_CAPTURE_LIMIT: {}, using 180", limit);
+            }
+        }
+        if (*capture_dir != '\0' && capture_limit > 0) {
+            cb5_capture =
+                std::make_unique<Cb5Capture>(std::filesystem::path(capture_dir), capture_limit);
+            AWAKENING_INFO(
+                "CB5 capture enabled: {} frames -> {}",
+                capture_limit,
+                cb5_capture->root.string()
+            );
+        }
+    }
     Scheduler s;
     std::atomic<Mode> mode = str_to_Mode(config["mode"].as<std::string>());
     std::atomic<EnemyColor> enemy_color =
@@ -300,6 +425,9 @@ int main(int argc, char** argv) {
     // sim adapter below is the only writer; guard the shared WheelOdometry snapshot so
     // the solver and debug logger never observe a torn position/timestamp.
     std::mutex wheel_odometry_mutex;
+#ifdef USE_Daedalus
+    runtime::DaedalusFramePoseStore daedalus_pose_store;
+#endif
     auto tf = SimpleRobotTF::create();
     {
         for (auto [from, to]: std::array {
@@ -339,6 +467,15 @@ int main(int argc, char** argv) {
                 T.translation() << pose->x, pose->y, pose->z;
                 T.linear() =
                     Quaternion { pose->qw, pose->qx, pose->qy, pose->qz }.toRotationMatrix();
+
+                if (static_cast<size_t>(idx) < 4) {
+                    daedalus_pose_store.record(
+                        static_cast<size_t>(idx),
+                        pose->frame_seq,
+                        pose->timestamp_ns,
+                        T
+                    );
+                }
 
                 tf->push(parent, child, TimePoint(std::chrono::nanoseconds(pose->timestamp_ns)), T);
                 if (idx == talos::ipc::PoseIndex::POSE_ODOM) {
@@ -381,23 +518,22 @@ int main(int argc, char** argv) {
                 );
             }
 
+            std::optional<ImageFrame> synchronized_image;
             if (auto frame = daedalus_shm_client->recv_image()) {
                 // Talos images are zero-copy views into a 3-slot shared-memory pool. The
                 // scheduler/detector is asynchronous, so a later producer frame can overwrite
                 // the slot while it is still being processed. Copy once at the boundary.
-                ImageFrame img_frame {
+                synchronized_image = ImageFrame {
                     .src_img = frame->image.clone(),
                     .format = PixelFormat::RGB,
                     .timestamp = TimePoint(std::chrono::nanoseconds(frame->timestamp_ns)),
+                    .source_sequence = frame->seq,
                 };
-                s.runtime_push_source<CameraIO>(
-                    daedalus_imgs,
-                    [f = std::move(img_frame)]() mutable {
-                        return std::make_tuple(std::optional<CameraIO::second_type>(std::move(f)));
-                    }
-                );
             }
             if (auto ground_truth = daedalus_shm_client->recv_ground_truth()) {
+                if (cb5_capture) {
+                    cb5_capture->record_ground_truth(ground_truth.value());
+                }
                 if (dbg) {
                     dbg->ground_truth.set(ground_truth.value());
                 }
@@ -418,6 +554,75 @@ int main(int argc, char** argv) {
                 SimpleFrame::ODOM,
                 SimpleFrame::GIMBAL_ODOM
             );
+
+            // Publish only after every exact-sequence/exact-timestamp pose has reached TF.
+            // Keep aggregate diagnostics: per-frame warnings can saturate the log precisely
+            // when a synchronization fault needs to remain observable.
+            if (synchronized_image) {
+                static uint64_t received = 0;
+                static uint64_t released = 0;
+                static std::array<uint64_t, 4> outcomes {};
+                static runtime::DaedalusPoseBundleInspection last_inspection;
+                static uint64_t last_sequence = 0;
+                static uint64_t last_timestamp_ns = 0;
+                static auto last_log = Clock::now();
+                const auto timestamp_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        synchronized_image->timestamp.time_since_epoch()
+                    )
+                        .count()
+                );
+                const auto sequence = synchronized_image->source_sequence;
+                ++received;
+                last_sequence = sequence;
+                last_timestamp_ns = timestamp_ns;
+                last_inspection = daedalus_pose_store.inspect(sequence, timestamp_ns);
+                ++outcomes[static_cast<size_t>(last_inspection.failure)];
+                if (last_inspection.exact()) {
+                    ++released;
+                    s.runtime_push_source<CameraIO>(
+                        daedalus_imgs,
+                        [f = std::move(*synchronized_image)]() mutable {
+                            return std::make_tuple(
+                                std::optional<CameraIO::second_type>(std::move(f))
+                            );
+                        }
+                    );
+                }
+                const auto now = Clock::now();
+                if (now - last_log >= std::chrono::seconds(1)) {
+                    const auto& p = last_inspection.poses;
+                    AWAKENING_INFO(
+                        "daedalus_sync received/released: {}/{} reject missing/seq/ts: {}/{}/{} "
+                        "image={}/{} gimbal={}/{} odom={}/{} muzzle={}/{} camera={}/{}",
+                        received,
+                        released,
+                        outcomes[static_cast<size_t>(
+                            runtime::DaedalusPoseBundleFailure::MISSING_POSE
+                        )],
+                        outcomes[static_cast<size_t>(
+                            runtime::DaedalusPoseBundleFailure::SEQUENCE_MISMATCH
+                        )],
+                        outcomes[static_cast<size_t>(
+                            runtime::DaedalusPoseBundleFailure::TIMESTAMP_MISMATCH
+                        )],
+                        last_sequence,
+                        last_timestamp_ns,
+                        p[0].frame_sequence,
+                        p[0].timestamp_ns,
+                        p[1].frame_sequence,
+                        p[1].timestamp_ns,
+                        p[2].frame_sequence,
+                        p[2].timestamp_ns,
+                        p[3].frame_sequence,
+                        p[3].timestamp_ns
+                    );
+                    received = 0;
+                    released = 0;
+                    outcomes.fill(0);
+                    last_log = now;
+                }
+            }
         });
     }
 #endif
@@ -604,7 +809,7 @@ int main(int argc, char** argv) {
                 );
             }
             auto target = rune_target.read();
-            if (target.need_focus()) {
+            if (!rune_force_full_frame && target.need_focus()) {
                 auto camera_cv_in_old = tf->pose_a_in_b(
                     SimpleFrame(frame.frame_id),
                     SimpleFrame(target.get_target_state().frame_id),
@@ -615,11 +820,31 @@ int main(int argc, char** argv) {
                     camera_cv_in_old,
                     camera_info,
                     frame.img_frame.src_img.size(),
-                    armor_detector.get_net_wh_ratio()
+                    rune_detector.get_net_wh_ratio()
                 );
             }
             TimedRuneDetection timed_rune;
             timed_rune.detector_start = Clock::now();
+            timed_rune.source_sequence = frame.img_frame.source_sequence;
+            if (cb5_capture && cb5_capture->includes(frame.id)) {
+                cv::Mat saved;
+                if (frame.img_frame.format == PixelFormat::RGB) {
+                    cv::cvtColor(frame.img_frame.src_img, saved, cv::COLOR_RGB2BGR);
+                } else {
+                    saved = frame.img_frame.src_img;
+                }
+                std::ostringstream name;
+                name << "frame_" << std::setw(6) << std::setfill('0') << frame.id << "_seq_"
+                     << frame.img_frame.source_sequence << "_ts_"
+                     << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            frame.img_frame.timestamp.time_since_epoch()
+                        )
+                            .count()
+                     << ".png";
+                if (!cv::imwrite((cb5_capture->root / "images" / name.str()).string(), saved)) {
+                    AWAKENING_WARN("failed to save CB5 capture image {}", name.str());
+                }
+            }
             {
                 bool got = detector_sem->try_acquire();
                 utils::SemaphoreGuard guard(*detector_sem, got); //并发控制
@@ -631,6 +856,14 @@ int main(int argc, char** argv) {
                 }
             }
             timed_rune.detector_end = Clock::now();
+            timed_rune.focus = net_focus;
+            timed_rune.full_frame = net_focus
+                == cv::Rect(
+                    0,
+                    0,
+                    frame.img_frame.src_img.cols,
+                    frame.img_frame.src_img.rows
+                );
             timed_rune.detection.frame_id = frame.frame_id;
             timed_rune.detection.id = frame.id;
             timed_rune.detection.timestamp = frame.img_frame.timestamp;
@@ -642,6 +875,24 @@ int main(int argc, char** argv) {
 
         if (dbg && is_web_running()) {
             dbg->expanded.set(net_focus);
+            frame.img_frame.detector_sequence = static_cast<uint64_t>(frame.id);
+            frame.img_frame.debug_cache_timestamp = Clock::now();
+            // Clear overlays before publishing a new raw frame. The tracker may replace this
+            // empty result later in the same pipeline pass, but an old target is never drawn on
+            // a newer no-detection image.
+            if (mode == Mode::AutoAim) {
+                dbg->armors.set(auto_aim::Armors {
+                    .timestamp = frame.img_frame.timestamp,
+                    .id = frame.id,
+                    .frame_id = frame.frame_id,
+                });
+            } else {
+                auto_buff::RuneDetection empty_rune;
+                empty_rune.timestamp = frame.img_frame.timestamp;
+                empty_rune.id = frame.id;
+                empty_rune.frame_id = frame.frame_id;
+                dbg->rune.set(std::move(empty_rune));
+            }
             dbg->img_frame.set(std::move(frame.img_frame));
         }
 
@@ -711,8 +962,169 @@ int main(int argc, char** argv) {
 
                 auto __rune_target =
                     rune_tracker.track(rune, camera_info, camera_cv_in_odom, rune.frame_id);
+                const auto tracker_diagnostics = rune_tracker.diagnostics();
 
                 rune_target.write(__rune_target);
+                if (cb5_capture && cb5_capture->includes(rune.id)) {
+                    const auto ground_truth =
+                        cb5_capture->ground_truth_for(timed_rune.source_sequence);
+                    runtime::DaedalusFramePoseSnapshots pose_snapshots {};
+#ifdef USE_Daedalus
+                    pose_snapshots =
+                        daedalus_pose_store.snapshot(timed_rune.source_sequence);
+#endif
+                    const auto image_timestamp_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            rune.timestamp.time_since_epoch()
+                        )
+                            .count();
+                    bool pose_sync_exact = timed_rune.source_sequence != 0;
+                    for (const auto& pose: pose_snapshots) {
+                        pose_sync_exact = pose_sync_exact && pose.valid
+                            && pose.frame_sequence == timed_rune.source_sequence
+                            && pose.timestamp_ns == static_cast<uint64_t>(image_timestamp_ns);
+                    }
+                    const Quaternion camera_odom_q(camera_cv_in_odom.rotation());
+                    const auto tracker_position = __rune_target.get_target_state().pos();
+                    std::lock_guard<std::mutex> capture_lock(cb5_capture->mutex);
+                    const auto& infer = rune.infer_diagnostics;
+                    const auto stamp = [&](size_t idx) -> const runtime::DaedalusPoseSnapshot& {
+                        return pose_snapshots[idx];
+                    };
+                    cb5_capture->frames
+                        << rune.id << ',' << timed_rune.source_sequence << ','
+                        << image_timestamp_ns << ',' << timed_rune.detected << ','
+                        << infer.raw_anchors << ',' << infer.class_candidates << ','
+                        << infer.rejected_by_configured_min << ',' << infer.rejected_invalid_r
+                        << ',' << infer.rejected_invalid_cardinal << ','
+                        << infer.rejected_by_aw_strict_rule << ',' << infer.aw_before_nms << ','
+                        << infer.aw_after_nms << ',' << infer.original_before_nms << ','
+                        << infer.original_after_nms << ',' << rune.fan_blades.size() << ','
+                        << pose_sync_exact << ',' << stamp(3).frame_sequence << ','
+                        << stamp(3).timestamp_ns << ',' << stamp(0).frame_sequence << ','
+                        << stamp(0).timestamp_ns << ',' << stamp(1).frame_sequence << ','
+                        << stamp(1).timestamp_ns << ',' << stamp(2).frame_sequence << ','
+                        << stamp(2).timestamp_ns << ','
+                        << camera_cv_in_odom.translation().x() << ','
+                        << camera_cv_in_odom.translation().y() << ','
+                        << camera_cv_in_odom.translation().z() << ',' << camera_odom_q.w() << ','
+                        << camera_odom_q.x() << ',' << camera_odom_q.y() << ','
+                        << camera_odom_q.z() << ',' << camera_info.camera_fx() << ','
+                        << camera_info.camera_fy() << ',' << camera_info.camera_cx() << ','
+                        << camera_info.camera_cy();
+                    for (int coefficient = 0; coefficient < 5; ++coefficient) {
+                        cb5_capture->frames << ','
+                                            << camera_info.distortion_coefficients.at<double>(
+                                                   0,
+                                                   coefficient
+                                               );
+                    }
+                    cb5_capture->frames << ',' << talos::ipc::IMAGE_WIDTH << ','
+                                        << talos::ipc::IMAGE_HEIGHT << ','
+                        << tracker_position.x() << ','
+                        << tracker_position.y() << ',' << tracker_position.z() << ','
+                        << static_cast<int>(__rune_target.track_state.tracker_state) << ','
+                        << tracker_diagnostics.valid_matches << '\n';
+                    const auto write_ground_truth_row = [&](int rune_index,
+                                                            const talos::ipc::GroundTruthRune* gt) {
+                        const bool batch_exact = ground_truth
+                            && ground_truth->frame_seq == timed_rune.source_sequence
+                            && ground_truth->timestamp_ns
+                                == static_cast<uint64_t>(image_timestamp_ns);
+                        const bool exact = batch_exact && gt
+                            && gt->frame_seq == timed_rune.source_sequence
+                            && gt->timestamp_ns == static_cast<uint64_t>(image_timestamp_ns);
+                        cb5_capture->ground_truth
+                            << rune.id << ',' << timed_rune.source_sequence << ','
+                            << image_timestamp_ns << ',' << static_cast<bool>(ground_truth) << ','
+                            << exact << ',' << (ground_truth ? ground_truth->frame_seq : 0) << ','
+                            << (ground_truth ? ground_truth->timestamp_ns : 0) << ','
+                            << rune_index;
+                        if (!gt) {
+                            for (int column = 0; column < 23; ++column) {
+                                cb5_capture->ground_truth << ',';
+                            }
+                            cb5_capture->ground_truth << '\n';
+                            return;
+                        }
+                        cb5_capture->ground_truth
+                            << ',' << gt->frame_seq << ',' << gt->timestamp_ns << ','
+                            << static_cast<int>(gt->team) << ','
+                            << static_cast<int>(gt->rune_mode) << ','
+                            << static_cast<int>(gt->mechanism_state) << ','
+                            << gt->r_center_odom[0] << ',' << gt->r_center_odom[1] << ','
+                            << gt->r_center_odom[2] << ',' << gt->radius << ','
+                            << gt->current_angle << ',' << gt->v_roll << ',' << gt->direction
+                            << ',' << gt->sin_amplitude << ',' << gt->sin_omega << ','
+                            << gt->sin_phase << ',' << gt->sin_offset << ','
+                            << gt->relative_time << ',' << gt->blade_id;
+                        for (const auto activation: gt->target_activations) {
+                            cb5_capture->ground_truth << ',' << static_cast<int>(activation);
+                        }
+                        cb5_capture->ground_truth << '\n';
+                    };
+                    if (!ground_truth || ground_truth->rune_count == 0) {
+                        write_ground_truth_row(-1, nullptr);
+                    } else {
+                        const auto count = std::min<size_t>(
+                            ground_truth->rune_count,
+                            talos::ipc::GROUND_TRUTH_MAX_RUNES
+                        );
+                        for (size_t rune_index = 0; rune_index < count; ++rune_index) {
+                            write_ground_truth_row(
+                                static_cast<int>(rune_index),
+                                &ground_truth->runes[rune_index]
+                            );
+                        }
+                    }
+                    for (const auto& candidate: infer.candidates) {
+                        cb5_capture->candidates
+                            << rune.id << ',' << timed_rune.source_sequence << ','
+                            << candidate.anchor << ',' << candidate.class_id << ','
+                            << candidate.class_confidence << ',' << candidate.valid_keypoints << ','
+                            << candidate.rejected_by_configured_min << ','
+                            << candidate.rejected_invalid_r << ','
+                            << candidate.rejected_invalid_cardinal << ','
+                            << candidate.accepted_by_aw << ','
+                            << candidate.accepted_by_original_policy;
+                        for (size_t k = 0; k < candidate.raw_points.size(); ++k) {
+                            cb5_capture->candidates
+                                << ',' << candidate.raw_points[k].x << ','
+                                << candidate.raw_points[k].y << ','
+                                << candidate.keypoint_confidences[k];
+                        }
+                        cb5_capture->candidates << '\n';
+                    }
+                    for (size_t fan_index = 0; fan_index < rune.fan_blades.size(); ++fan_index) {
+                        const auto& fan = rune.fan_blades[fan_index];
+                        cb5_capture->fans
+                            << rune.id << ',' << timed_rune.source_sequence << ',' << fan_index
+                            << ',' << static_cast<int>(fan.activation) << ',' << fan.confidence
+                            << ',' << fan.pose_valid << ',' << fan.reprojection_error_px << ','
+                            << fan.pose_camera_cv.translation().x() << ','
+                            << fan.pose_camera_cv.translation().y() << ','
+                            << fan.pose_camera_cv.translation().z() << ','
+                            << fan.pose.translation().x() << ',' << fan.pose.translation().y()
+                            << ',' << fan.pose.translation().z() << ','
+                            << fan.tracker_predicted_position.x() << ','
+                            << fan.tracker_predicted_position.y() << ','
+                            << fan.tracker_predicted_position.z() << ',' << fan.match_best_id << ','
+                            << fan.match_id << ',' << fan.match_best_d2;
+                        for (double residual: fan.match_residual_ypd_rotation) {
+                            cb5_capture->fans << ',' << residual;
+                        }
+                        for (size_t k = 0; k < fan.raw_points.size(); ++k) {
+                            cb5_capture->fans << ',' << fan.raw_points[k].x << ','
+                                              << fan.raw_points[k].y << ','
+                                              << fan.raw_confidences[k];
+                        }
+                        cb5_capture->fans << '\n';
+                    }
+                    cb5_capture->frames.flush();
+                    cb5_capture->candidates.flush();
+                    cb5_capture->fans.flush();
+                    cb5_capture->ground_truth.flush();
+                }
                 const auto tracker_end = Clock::now();
                 const auto& timing = rune.timing;
                 cb5_perf_ctx.add(Cb5PerfSample {
@@ -737,6 +1149,17 @@ int main(int argc, char** argv) {
                           )
                               .count()
                         : 0.0,
+                    .focus = timed_rune.focus,
+                    .full_frame = timed_rune.full_frame,
+                    .fan_blades = tracker_diagnostics.fan_blades,
+                    .pose_valid_fan_blades = tracker_diagnostics.pose_valid_fan_blades,
+                    .valid_matches = tracker_diagnostics.valid_matches,
+                    .initialized = tracker_diagnostics.initialized,
+                    .tracker_state = __rune_target.track_state.tracker_state,
+                    .clock_wise_count = __rune_target.voter.clock_wise_count,
+                    .double_detect_count = __rune_target.voter.double_detect_count,
+                    .voter_state = __rune_target.voter.state,
+                    .voter_mode = __rune_target.voter.mode,
                 });
                 if (io.detect_start) {
                     auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -941,6 +1364,61 @@ int main(int argc, char** argv) {
                     total.first,
                     total.second
                 );
+                if (rune_log_diagnostics) {
+                    const auto fan_blades = std::accumulate(
+                        samples.begin(),
+                        samples.end(),
+                        0,
+                        [](int sum, const auto& sample) { return sum + sample.fan_blades; }
+                    );
+                    const auto pose_valid = std::accumulate(
+                        samples.begin(),
+                        samples.end(),
+                        0,
+                        [](int sum, const auto& sample) {
+                            return sum + sample.pose_valid_fan_blades;
+                        }
+                    );
+                    const auto valid_matches = std::accumulate(
+                        samples.begin(),
+                        samples.end(),
+                        0,
+                        [](int sum, const auto& sample) { return sum + sample.valid_matches; }
+                    );
+                    const auto init_count = static_cast<int>(std::count_if(
+                        samples.begin(),
+                        samples.end(),
+                        [](const auto& sample) { return sample.initialized; }
+                    ));
+                    const auto dynamic_roi_count = static_cast<int>(std::count_if(
+                        samples.begin(),
+                        samples.end(),
+                        [](const auto& sample) { return !sample.full_frame; }
+                    ));
+                    const auto& last = samples.back();
+                    AWAKENING_INFO(
+                        "cb5_diag roi_mode: {} dynamic/full: {}/{} last_roi: [{},{},{},{}] "
+                        "fan_blades: {} pose_valid: {} valid_matches: {} init: {} "
+                        "tracker: {} clock_wise_count: {} double_detect_count: {} "
+                        "voter_state/mode: {}/{}",
+                        rune_force_full_frame ? "forced_full" : "dynamic",
+                        dynamic_roi_count,
+                        static_cast<int>(samples.size()) - dynamic_roi_count,
+                        last.focus.x,
+                        last.focus.y,
+                        last.focus.width,
+                        last.focus.height,
+                        fan_blades,
+                        pose_valid,
+                        valid_matches,
+                        init_count,
+                        auto_buff::RuneTarget::TrackState::string_by_state(last.tracker_state),
+                        last.clock_wise_count,
+                        last.double_detect_count,
+                        last.voter_state,
+                        last.voter_mode
+                    );
+                }
             }
         }
         log_ctx.reset();
@@ -991,7 +1469,25 @@ int main(int argc, char** argv) {
                 }
                 if (!debug_img.empty()) {
                     web.draw(debug_img, dbg.value());
-                    web.write_shm(debug_img);
+                    const auto web_sequence = web.write_shm(debug_img, img);
+                    static auto last_frame_diag = Clock::now();
+                    const auto now = Clock::now();
+                    if (now - last_frame_diag >= std::chrono::seconds(1)) {
+                        const auto age_ms =
+                            std::chrono::duration<double, std::milli>(
+                                now - img.debug_cache_timestamp
+                            )
+                                .count();
+                        AWAKENING_INFO(
+                            "visual_frame capture={} detector={} web={} cache_age_ms={:.1f} stale={}",
+                            img.source_sequence,
+                            img.detector_sequence,
+                            web_sequence,
+                            age_ms,
+                            age_ms > 500.0
+                        );
+                        last_frame_diag = now;
+                    }
                 }
             }
 

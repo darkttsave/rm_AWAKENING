@@ -5,6 +5,14 @@
 #include "utils/impl.hpp"
 #include <yaml-cpp/node/node.h>
 namespace awakening::auto_buff {
+struct RuneTrackerDiagnostics {
+    int fan_blades = 0;
+    int pose_valid_fan_blades = 0;
+    int valid_matches = 0;
+    bool initialized = false;
+    bool found = false;
+};
+
 class RuneTracker {
 public:
     RuneTracker(const YAML::Node& config);
@@ -17,5 +25,6 @@ public:
     );
     int get_count();
     void reset_count();
+    [[nodiscard]] RuneTrackerDiagnostics diagnostics() const;
 };
 } // namespace awakening::auto_buff

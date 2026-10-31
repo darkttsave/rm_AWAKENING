@@ -1,7 +1,7 @@
 # Daedalus CB5 OpenVINO auto-buff baseline: two detectors / two infer requests.
 # Rune model: SZU model-0624.onnx, output [1,18,6300]
 #   3 class scores: 0=inactive, 1=small_activated, 2=big_activated
-#   5 keypoints: kpt0/1/3/4 = armor-plate corners, kpt2 = R center
+#   5 keypoints: kpt0/1/3/4 = armor-target corners, kpt2 = R center
 # CPU resource settings are target-dependent; keep one stream as the portable baseline.
 mode: auto_buff
 enemy_color: blue
@@ -155,6 +155,10 @@ very_aimer:
 rune_detector:
   max_infer_num: 2
   backend: openvino
+  # Diagnostic only. Keep disabled for the normal dynamic-ROI path.
+  debug:
+    force_full_frame: false
+    log_diagnostics: false
   net_detector:
     openvino:
       model_path: ${ROOT_DIR}/model/model-0624.onnx

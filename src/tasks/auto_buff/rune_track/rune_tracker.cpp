@@ -3,6 +3,7 @@
 #include "tasks/auto_buff/type.hpp"
 #include "tasks/base/dta_utils.hpp"
 #include "utils/logger.hpp"
+#include <algorithm>
 #include <memory>
 namespace awakening::auto_buff {
 struct RuneTracker::Impl {
@@ -15,9 +16,20 @@ struct RuneTracker::Impl {
         const ISO3& camera_cv_in_odom,
         int frame_id
     ) {
-        const bool found = target_.track_state.tracker_state == RuneTarget::TrackState::LOST
+        diagnostics_ = {};
+        diagnostics_.fan_blades = static_cast<int>(detection.fan_blades.size());
+        const bool was_lost =
+            target_.track_state.tracker_state == RuneTarget::TrackState::LOST;
+        const bool found = was_lost
             ? init_target(detection, frame_id, camera_info, camera_cv_in_odom)
             : update_target(detection, camera_info, camera_cv_in_odom);
+        diagnostics_.found = found;
+        diagnostics_.initialized = was_lost && found;
+        diagnostics_.pose_valid_fan_blades = static_cast<int>(std::count_if(
+            detection.fan_blades.begin(),
+            detection.fan_blades.end(),
+            [](const auto& fan) { return fan.pose_valid; }
+        ));
         if (target_.get_target_state().pos().norm() > 15.0 && target_.check()) {
             target_.track_state.tracker_state = RuneTarget::TrackState::LOST;
             AWAKENING_WARN("TOO FAR");
@@ -74,6 +86,7 @@ struct RuneTracker::Impl {
             camera_info,
             camera_cv_in_odom
         );
+        diagnostics_.valid_matches = std::get<0>(updated);
         return std::get<0>(updated) > 0;
     }
     void update_fsm(bool found, const TimePoint& now) noexcept {
@@ -92,6 +105,7 @@ struct RuneTracker::Impl {
     RuneTrackerCfg cfg_;
     RuneTarget target_;
     int found_count_ = 0;
+    RuneTrackerDiagnostics diagnostics_;
 };
 RuneTracker::RuneTracker(const YAML::Node& config): _impl(std::make_unique<Impl>(config)) {}
 RuneTracker::~RuneTracker() noexcept = default;
@@ -108,5 +122,8 @@ int RuneTracker::get_count() {
 }
 void RuneTracker::reset_count() {
     _impl->found_count_ = 0;
+}
+RuneTrackerDiagnostics RuneTracker::diagnostics() const {
+    return _impl->diagnostics_;
 }
 } // namespace awakening::auto_buff

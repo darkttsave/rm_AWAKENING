@@ -12,7 +12,10 @@ public:
         return std::make_unique<RuneInfer>(config);
     }
 
-    [[nodiscard]] std::vector<RuneFanBladeWithR> process(const cv::Mat& output_buffer) const;
+    [[nodiscard]] std::vector<RuneFanBladeWithR> process(
+        const cv::Mat& output_buffer,
+        RuneInferDiagnostics* diagnostics = nullptr
+    ) const;
 
     int input_w() const noexcept;
     int input_h() const noexcept;

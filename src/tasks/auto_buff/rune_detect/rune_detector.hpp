@@ -9,6 +9,7 @@ class RuneDetector {
 public:
     RuneDetector(const YAML::Node& config);
     RuneDetection detect(const CommonFrame& frame, const cv::Rect& focus, EnemyColor enemy_color);
+    [[nodiscard]] double get_net_wh_ratio() const noexcept;
     AWAKENING_IMPL_DEFINITION(RuneDetector)
 };
 } // namespace awakening::auto_buff

@@ -1,7 +1,7 @@
 # Daedalus CB5 TensorRT auto-buff baseline: two detectors / two execution contexts.
 # Rune model: SZU model-0624.onnx, output [1,18,6300]
 #   3 class scores: 0=inactive, 1=small_activated, 2=big_activated
-#   5 keypoints: kpt0/1/3/4 = armor-plate corners, kpt2 = R center
+#   5 keypoints: kpt0/1/3/4 = armor-target corners, kpt2 = R center
 # The cached engine is specific to the TensorRT/CUDA/GPU environment and can be regenerated.
 mode: auto_buff
 enemy_color: blue
@@ -155,6 +155,10 @@ very_aimer:
 rune_detector:
   max_infer_num: 2
   backend: tensorrt
+  # Diagnostic only. Keep disabled for the normal dynamic-ROI path.
+  debug:
+    force_full_frame: true
+    log_diagnostics: true
   net_detector:
     openvino:
       model_path: ${ROOT_DIR}/model/model-0624.onnx
@@ -179,7 +183,7 @@ rune_detector:
       use_cuda_preproces: true
     rune_infer:
       model_type: cb5
-      conf_threshold: 0.20
+      conf_threshold: 0.10
       keypoint_conf_threshold: 0.30
       nms_distance: 30.0
       min_valid_kpts: 4

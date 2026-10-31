@@ -197,15 +197,30 @@ struct RuneInfer::Impl {
         params_.load(config);
     }
 
-    [[nodiscard]] std::vector<RuneFanBladeWithR> process(const cv::Mat& output_buffer) const {
+    [[nodiscard]] std::vector<RuneFanBladeWithR>
+    process(const cv::Mat& output_buffer, RuneInferDiagnostics* diagnostics) const {
+        if (diagnostics) {
+            *diagnostics = {};
+            diagnostics->keypoint_conf_threshold =
+                static_cast<float>(params_.keypoint_conf_threshold);
+            diagnostics->configured_min_valid_keypoints = params_.min_valid_kpts;
+        }
         try {
-            auto results = post_process(output_buffer);
+            auto results = post_process(output_buffer, diagnostics);
             switch (params_.mode) {
                 case Mode::CB:
                     // 保持原九点模式的后处理路径不变。
                     return topk_and_nms(results);
                 case Mode::CB5:
-                    return nms_by_center(std::move(results), static_cast<float>(params_.nms_distance));
+                    if (diagnostics)
+                        diagnostics->aw_before_nms = static_cast<int>(results.size());
+                    results = nms_by_center(
+                        std::move(results),
+                        static_cast<float>(params_.nms_distance)
+                    );
+                    if (diagnostics)
+                        diagnostics->aw_after_nms = static_cast<int>(results.size());
+                    return results;
             }
         } catch (const std::exception& e) {
             AWAKENING_ERROR("rune infer postprocess failed: {}", e.what());
@@ -214,14 +229,17 @@ struct RuneInfer::Impl {
         }
         return {};
     }
-    [[nodiscard]] std::vector<RuneFanBladeWithR> post_process(const cv::Mat& output_buffer) const {
+    [[nodiscard]] std::vector<RuneFanBladeWithR> post_process(
+        const cv::Mat& output_buffer,
+        RuneInferDiagnostics* diagnostics
+    ) const {
         if (output_buffer.empty())
             return {};
         switch (params_.mode) {
             case Mode::CB:
                 return post_processCB_impl(output_buffer);
             case Mode::CB5:
-                return post_processCB5_impl(output_buffer);
+                return post_processCB5_impl(output_buffer, diagnostics);
         }
         return {};
     }
@@ -287,7 +305,8 @@ struct RuneInfer::Impl {
     }
 
     // model-0624: 3 class scores + 5 keypoints * (x, y, conf) = 18 channels.
-    std::vector<RuneFanBladeWithR> post_processCB5_impl(const cv::Mat& out) const {
+    std::vector<RuneFanBladeWithR>
+    post_processCB5_impl(const cv::Mat& out, RuneInferDiagnostics* diagnostics) const {
         constexpr int channels = ModelTraits<Mode::CB5>::NUM_CLASSES
             + ModelTraits<Mode::CB5>::NUM_POINTS * ModelTraits<Mode::CB5>::KPT_DIM;
         if (out.empty() || out.type() != CV_32F) {
@@ -307,6 +326,8 @@ struct RuneInfer::Impl {
             return {};
         }
         const int anchors = channel_first ? out.cols : out.rows;
+        if (diagnostics)
+            diagnostics->raw_anchors = anchors;
         const auto at = [&](int c, int i) -> float {
             return channel_first ? out.at<float>(c, i) : out.at<float>(i, c);
         };
@@ -325,6 +346,9 @@ struct RuneInfer::Impl {
             }
             if (best_cls < 0 || class_conf < params_.conf_threshold)
                 continue;
+
+            if (diagnostics)
+                ++diagnostics->class_candidates;
 
             std::array<cv::Point2f, ModelTraits<Mode::CB5>::NUM_POINTS> raw;
             std::array<float, ModelTraits<Mode::CB5>::NUM_POINTS> raw_conf {};
@@ -353,18 +377,40 @@ struct RuneInfer::Impl {
                     && std::isfinite(raw[k].y)
                     && raw_conf[k] >= params_.keypoint_conf_threshold;
             }
+            const int configured_min = std::clamp(params_.min_valid_kpts, 1, 5);
+            const bool rejected_by_min = valid_kpts < configured_min;
+            RuneInferCandidateDiagnostics* candidate_diagnostics = nullptr;
+            if (diagnostics) {
+                auto& candidate = diagnostics->candidates.emplace_back();
+                candidate.anchor = i;
+                candidate.class_id = best_cls;
+                candidate.class_confidence = class_conf;
+                candidate.raw_points = raw;
+                candidate.keypoint_confidences = raw_conf;
+                candidate.valid_keypoints = valid_kpts;
+                candidate.rejected_by_configured_min = rejected_by_min;
+                candidate.rejected_invalid_r = !r_valid;
+                candidate.rejected_invalid_cardinal = !corners_valid;
+                candidate_diagnostics = &candidate;
+                diagnostics->rejected_by_configured_min += rejected_by_min ? 1 : 0;
+                diagnostics->rejected_invalid_r += !r_valid ? 1 : 0;
+                diagnostics->rejected_invalid_cardinal += !corners_valid ? 1 : 0;
+            }
             // R 必须有效；四角也必须全部有效，否则不把无效点送入 PnP。
             if (valid_kpts < std::clamp(params_.min_valid_kpts, 4, 5) || !r_valid
                 || !corners_valid)
             {
+                if (diagnostics)
+                    ++diagnostics->rejected_by_aw_strict_rule;
                 continue;
             }
+            if (candidate_diagnostics)
+                candidate_diagnostics->accepted_by_aw = true;
 
-            // 官方标注顺序（实测）：
-            //   0 = 上, 1 = 左, 2 = R, 3 = 右, 4 = 下。
-            // 下游六点顺序是上/左/下/右/中/R，因此 3 与 4 需要交换。
+            // Upstream raw order is 0/1/2(R)/3/4.  On the target, 0/1/4/3 are the
+            // outer/left/inner/right protruding edge centres (see the labelled examples).
             RuneFanBladeWithR rune;
-            rune.geometry = RuneBladeGeometry::CARDINAL_4_R150;
+            rune.geometry = RuneBladeGeometry::CB5_EDGE_CENTERS_R150;
             rune.activation = static_cast<RuneActivation>(best_cls);
             rune.confidence = class_conf;
             rune.color = RuneColor::NONE; // 类别是激活状态，不是红蓝颜色
@@ -409,9 +455,11 @@ RuneInfer::RuneInfer(const YAML::Node& config) {
 RuneInfer::~RuneInfer() noexcept {
     _impl.reset();
 }
-[[nodiscard]] std::vector<RuneFanBladeWithR> RuneInfer::process(const cv::Mat& output_buffer
+[[nodiscard]] std::vector<RuneFanBladeWithR> RuneInfer::process(
+    const cv::Mat& output_buffer,
+    RuneInferDiagnostics* diagnostics
 ) const {
-    return _impl->process(output_buffer);
+    return _impl->process(output_buffer, diagnostics);
 }
 
 int RuneInfer::input_w() const noexcept {

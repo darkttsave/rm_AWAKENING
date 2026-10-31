@@ -1,6 +1,25 @@
 const LOG_POLL_INTERVAL_MS = 500;
 const VIDEO_VIEWPORT_GAP_PX = 12;
 
+async function updateFrameStatus() {
+  const pill = document.getElementById("frame-status");
+  if (!pill) return;
+  try {
+    const response = await fetch("/frame_status", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const status = await response.json();
+    const age = status.cache_age_ms == null ? "--" : `${Math.round(status.cache_age_ms)}ms`;
+    pill.textContent = `C${status.capture_seq} D${status.detector_seq} W${status.web_seq} ${age}`;
+    pill.title = `capture timestamp: ${status.capture_timestamp_ns}; cache sequence: ${status.cache_seq}`;
+    pill.classList.toggle("ok", !status.stale);
+    pill.classList.toggle("error", status.stale);
+  } catch (_error) {
+    pill.textContent = "FRAME --";
+    pill.classList.remove("ok");
+    pill.classList.add("error");
+  }
+}
+
 function switchTab(name) {
   document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tab === name);
@@ -79,6 +98,8 @@ document.addEventListener("DOMContentLoaded", () => {
   startDataLoop();
   fetchAndDisplayJsonWithTree("json-log", "/log");
   setInterval(() => fetchAndDisplayJsonWithTree("json-log", "/log"), LOG_POLL_INTERVAL_MS);
+  updateFrameStatus();
+  setInterval(updateFrameStatus, LOG_POLL_INTERVAL_MS);
 
   document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));

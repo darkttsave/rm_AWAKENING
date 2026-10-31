@@ -484,7 +484,10 @@ struct RuneDetector::Impl {
                 result.timing.output_copy_ms = net_output.output_copy_ms;
                 if (!net_output.output.empty()) {
                     const auto postprocess_start = Clock::now();
-                    result.fan_blades = rune_infer_->process(net_output.output);
+                    result.fan_blades = rune_infer_->process(
+                        net_output.output,
+                        &result.infer_diagnostics
+                    );
                     result.timing.postprocess_ms = std::chrono::duration<double, std::milli>(
                                                        Clock::now() - postprocess_start
                     )
@@ -493,6 +496,80 @@ struct RuneDetector::Impl {
                         fan_blade.transform(net_output.transform_matrix);
                         fan_blade.add_offset(focus_rect.tl());
                     }
+                    // Replay the original SZU candidate policy on the exact same tensor:
+                    // configured valid-point count, source-coordinate bounds, quality sort,
+                    // then 30 px center-distance NMS.  This is diagnostic only.
+                    struct OriginalCandidate {
+                        size_t index;
+                        float quality;
+                        cv::Point2f center;
+                    };
+                    std::vector<OriginalCandidate> original;
+                    for (size_t index = 0;
+                         index < result.infer_diagnostics.candidates.size();
+                         ++index)
+                    {
+                        auto& candidate = result.infer_diagnostics.candidates[index];
+                        bool coordinates_valid = true;
+                        cv::Point2f center {};
+                        float confidence_sum = 0.0F;
+                        int valid = 0;
+                        for (size_t k = 0; k < candidate.raw_points.size(); ++k) {
+                            auto point = utils::transform_point2D(
+                                net_output.transform_matrix,
+                                candidate.raw_points[k]
+                            );
+                            point += cv::Point2f(focus_rect.tl());
+                            candidate.raw_points[k] = point;
+                            if (!std::isfinite(point.x) || !std::isfinite(point.y)
+                                || point.x < 0.0F || point.y < 0.0F)
+                            {
+                                coordinates_valid = false;
+                            }
+                            if (candidate.keypoint_confidences[k]
+                                >= result.infer_diagnostics.keypoint_conf_threshold)
+                            {
+                                center += point;
+                                confidence_sum += candidate.keypoint_confidences[k];
+                                ++valid;
+                            }
+                        }
+                        if (coordinates_valid
+                            && valid >= result.infer_diagnostics.configured_min_valid_keypoints)
+                        {
+                            center *= 1.0F / static_cast<float>(valid);
+                            candidate.accepted_by_original_policy = true;
+                            original.push_back(OriginalCandidate {
+                                .index = index,
+                                .quality = candidate.class_confidence
+                                    * confidence_sum / static_cast<float>(valid),
+                                .center = center,
+                            });
+                        }
+                    }
+                    result.infer_diagnostics.original_before_nms =
+                        static_cast<int>(original.size());
+                    std::sort(
+                        original.begin(),
+                        original.end(),
+                        [](const auto& lhs, const auto& rhs) {
+                            return lhs.quality > rhs.quality;
+                        }
+                    );
+                    std::vector<cv::Point2f> kept_centers;
+                    for (const auto& candidate: original) {
+                        const bool overlaps = std::any_of(
+                            kept_centers.begin(),
+                            kept_centers.end(),
+                            [&](const auto& center) {
+                                return cv::norm(center - candidate.center) < 30.0F;
+                            }
+                        );
+                        if (!overlaps)
+                            kept_centers.push_back(candidate.center);
+                    }
+                    result.infer_diagnostics.original_after_nms =
+                        static_cast<int>(kept_centers.size());
                 } else {
                     AWAKENING_WARN("rune detector: empty network output");
                 }
@@ -549,6 +626,12 @@ struct RuneDetector::Impl {
             std::chrono::duration<double, std::milli>(Clock::now() - detector_start).count();
         return result;
     }
+    [[nodiscard]] double get_net_wh_ratio() const noexcept {
+        if (!rune_infer_ || rune_infer_->input_h() <= 0) {
+            return 1.0;
+        }
+        return static_cast<double>(rune_infer_->input_w()) / rune_infer_->input_h();
+    }
     utils::NetDetectorBase::Ptr net_detector_;
     RuneInfer::Ptr rune_infer_;
 };
@@ -561,5 +644,8 @@ RuneDetector::~RuneDetector() noexcept {
 RuneDetection
 RuneDetector::detect(const CommonFrame& frame, const cv::Rect& focus, EnemyColor enemy_color) {
     return _impl->detect(frame, focus, enemy_color);
+}
+double RuneDetector::get_net_wh_ratio() const noexcept {
+    return _impl->get_net_wh_ratio();
 }
 } // namespace awakening::auto_buff

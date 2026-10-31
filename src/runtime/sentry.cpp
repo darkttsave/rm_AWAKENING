@@ -867,7 +867,7 @@ int main(int argc, char** argv) {
             }
             if (!debug_img.empty()) {
                 web.draw(debug_img, dbg.value());
-                web.write_shm(debug_img);
+                web.write_shm(debug_img, img);
             }
         });
 #ifdef USE_ROS2

@@ -13,7 +13,7 @@ import setproctitle
 setproctitle.setproctitle("wust_vision_web")
 
 app = Flask(__name__)
-app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 3600
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 STREAM_FPS = 60
 FRAME_INTERVAL = 1.0 / STREAM_FPS
@@ -21,6 +21,10 @@ JSON_CACHE_TTL = 0.05
 
 shared_memory_path = "/dev/shm/awakening_frame"
 shared_size = 2 * 1024 * 1024  # 2MB
+FRAME_MAGIC = 0x57414B45
+FRAME_VERSION = 1
+FRAME_HEADER = struct.Struct("<IHHQIIQQQqq")
+FRAME_STALE_SECONDS = 0.5
 data_path = "/dev/shm/awakening_data.json"
 log_path = "/dev/shm/awakening_log.json"
 
@@ -38,6 +42,14 @@ use_shared_memory = False
 
 latest_jpg = None
 latest_seq = 0
+latest_cache_key = None
+latest_frame_status = {
+    "capture_seq": 0,
+    "detector_seq": 0,
+    "cache_seq": 0,
+    "capture_timestamp_ns": 0,
+    "cache_timestamp_ns": 0,
+}
 frame_cond = threading.Condition()
 stop_event = threading.Event()
 reader_thread = None
@@ -112,22 +124,39 @@ def read_jpeg_from_shared_memory():
 
     try:
         mapfile.seek(0)
-        size_bytes = mapfile.read(4)
-        if len(size_bytes) != 4:
+        prefix = mapfile.read(FRAME_HEADER.size)
+        if len(prefix) != FRAME_HEADER.size:
             return None
+        fields = FRAME_HEADER.unpack(prefix)
+        magic, version, header_size, generation, jpg_size = fields[:5]
+        if magic == FRAME_MAGIC and version == FRAME_VERSION:
+            if header_size != FRAME_HEADER.size or generation & 1:
+                return None
+            if not (0 < jpg_size <= shared_size - header_size):
+                return None
+            mapfile.seek(header_size)
+            data = mapfile.read(jpg_size)
+            mapfile.seek(0)
+            suffix = mapfile.read(FRAME_HEADER.size)
+            if suffix != prefix or not data.startswith(b"\xff\xd8"):
+                return None
+            return data, {
+                "cache_seq": fields[6],
+                "capture_seq": fields[7],
+                "detector_seq": fields[8],
+                "capture_timestamp_ns": fields[9],
+                "cache_timestamp_ns": fields[10],
+            }
 
-        jpg_size = struct.unpack("<I", size_bytes)[0]
+        # Compatibility with an older producer while binaries are being restarted.
+        jpg_size = struct.unpack("<I", prefix[:4])[0]
         if not (0 < jpg_size <= shared_size - 4):
             return None
-
+        mapfile.seek(4)
         data = mapfile.read(jpg_size)
-        if len(data) != jpg_size:
+        if len(data) != jpg_size or not data.startswith(b"\xff\xd8"):
             return None
-
-        if not data.startswith(b"\xff\xd8"):
-            return None
-
-        return data
+        return data, None
 
     except Exception:
         return None
@@ -196,19 +225,25 @@ def trim_series_json(data, max_points):
 
 
 def frame_reader_loop():
-    global latest_jpg, latest_seq, use_shared_memory
+    global latest_jpg, latest_seq, latest_cache_key, latest_frame_status, use_shared_memory
 
     last_fix_attempt = 0.0
     last_fix_log = 0.0
 
     while not stop_event.is_set():
-        jpg = read_jpeg_from_shared_memory()
+        result = read_jpeg_from_shared_memory()
 
-        if jpg is not None:
+        if result is not None:
+            jpg, metadata = result
             with frame_cond:
-                latest_jpg = jpg
-                latest_seq += 1
-                frame_cond.notify_all()
+                cache_key = tuple(metadata.values()) if metadata else None
+                if metadata is None or cache_key != latest_cache_key:
+                    latest_jpg = jpg
+                    latest_seq += 1
+                    latest_cache_key = cache_key
+                    if metadata:
+                        latest_frame_status = metadata
+                    frame_cond.notify_all()
 
             time.sleep(FRAME_INTERVAL)
             continue
@@ -366,6 +401,19 @@ def video_feed():
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["X-Accel-Buffering"] = "no"
     return response
+
+
+@app.route("/frame_status")
+def frame_status():
+    with frame_cond:
+        status = dict(latest_frame_status)
+        status["web_seq"] = latest_seq
+    cache_timestamp_ns = status.get("cache_timestamp_ns", 0)
+    age_ms = max(0.0, (time.time_ns() - cache_timestamp_ns) / 1_000_000.0) \
+        if cache_timestamp_ns else None
+    status["cache_age_ms"] = age_ms
+    status["stale"] = age_ms is None or age_ms > FRAME_STALE_SECONDS * 1000.0
+    return no_store_json(status)
 
 
 @app.route("/video/omni/<int:idx>")

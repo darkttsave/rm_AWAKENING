@@ -4,6 +4,7 @@
 #include "tasks/auto_buff/type.hpp"
 #include "utils/common/type_common.hpp"
 #include "utils/utils.hpp"
+#include <atomic>
 #include <array>
 #include <unordered_map>
 #include <memory>
@@ -466,6 +467,26 @@ struct Web::Impl {
 
             const std::string latency_str =
                 fmt::format("Avg Latency: {:.2f}ms", ctx.avg_latency_ms.get());
+            const auto frame = ctx.img_frame.get();
+            const auto cache_age_ms = std::chrono::duration<double, std::milli>(
+                                          now - frame.debug_cache_timestamp
+            )
+                                          .count();
+            const bool stale = frame.debug_cache_timestamp.time_since_epoch().count() == 0
+                || cache_age_ms > 500.0;
+            const auto capture_timestamp_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    frame.timestamp.time_since_epoch()
+                )
+                    .count();
+            const std::string frame_str = fmt::format(
+                "Capture: {} Detector: {} ts: {}",
+                frame.source_sequence,
+                frame.detector_sequence,
+                capture_timestamp_ns
+            );
+            const std::string cache_str =
+                fmt::format("Cache age: {:.0f}ms {}", cache_age_ms, stale ? "STALE" : "LIVE");
 
             int font = cv::FONT_HERSHEY_SIMPLEX;
             double scale = 0.8;
@@ -498,6 +519,24 @@ struct Web::Impl {
                 font,
                 scale,
                 cv::Scalar(255, 255, 255),
+                thickness
+            );
+            cv::putText(
+                img,
+                frame_str,
+                cv::Point(x, latency_y + time_size.height + line_gap),
+                font,
+                0.6,
+                cv::Scalar(255, 255, 255),
+                thickness
+            );
+            cv::putText(
+                img,
+                cache_str,
+                cv::Point(x, latency_y + 2 * (time_size.height + line_gap)),
+                font,
+                0.6,
+                stale ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0),
                 thickness
             );
         }
@@ -627,7 +666,7 @@ struct Web::Impl {
 #endif
     }
 
-    inline void write_shm(const cv::Mat& img) const {
+    inline uint64_t write_shm(const cv::Mat& img, const ImageFrame& frame) const {
 #ifdef USE_RERUN
         rerun_visual::Recorder::instance().log_image(img);
 #endif
@@ -663,27 +702,78 @@ struct Web::Impl {
                 if (fd_ != -1)
                     close(fd_);
             }
-            void write(const cv::Mat& img) {
+            uint64_t write(const cv::Mat& img, const ImageFrame& frame) {
                 if (!ptr_)
-                    return;
+                    return 0;
 
                 static const std::vector<int> jpeg_params = { cv::IMWRITE_JPEG_QUALITY, 75 };
 
                 std::vector<uchar> buf;
                 cv::imencode(".jpg", img, buf, jpeg_params);
 
-                if (buf.size() + 4 > shm_max_size)
-                    return;
+                if (buf.size() + sizeof(AwakeningFrameShmHeader) > shm_max_size)
+                    return 0;
 
-                uint32_t size = static_cast<uint32_t>(buf.size());
-                std::memcpy(ptr_, &size, 4);
-                std::memcpy(static_cast<char*>(ptr_) + 4, buf.data(), size);
+                auto* header = static_cast<AwakeningFrameShmHeader*>(ptr_);
+                if (header->magic != AWAKENING_FRAME_SHM_MAGIC
+                    || header->version != AWAKENING_FRAME_SHM_VERSION
+                    || header->header_size != sizeof(AwakeningFrameShmHeader))
+                {
+                    std::memset(header, 0, sizeof(*header));
+                    header->magic = AWAKENING_FRAME_SHM_MAGIC;
+                    header->version = AWAKENING_FRAME_SHM_VERSION;
+                    header->header_size = sizeof(AwakeningFrameShmHeader);
+                }
+
+                std::atomic_ref<uint64_t> generation(header->generation);
+                auto current_generation = generation.load(std::memory_order_relaxed);
+                if (current_generation & 1U) {
+                    ++current_generation;
+                }
+                generation.store(current_generation + 1, std::memory_order_release);
+                std::memcpy(
+                    static_cast<char*>(ptr_) + sizeof(AwakeningFrameShmHeader),
+                    buf.data(),
+                    buf.size()
+                );
+                header->jpeg_size = static_cast<uint32_t>(buf.size());
+                const bool unsequenced = frame.detector_sequence == 0
+                    && frame.source_sequence == 0
+                    && frame.debug_cache_timestamp.time_since_epoch().count() == 0;
+                if (unsequenced || !has_frame_
+                    || frame.detector_sequence != last_detector_sequence_
+                    || frame.source_sequence != last_capture_sequence_)
+                {
+                    ++cache_sequence_;
+                    last_detector_sequence_ = frame.detector_sequence;
+                    last_capture_sequence_ = frame.source_sequence;
+                    has_frame_ = true;
+                }
+                header->cache_sequence = cache_sequence_;
+                header->capture_sequence = frame.source_sequence;
+                header->detector_sequence = frame.detector_sequence;
+                header->capture_timestamp_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        frame.timestamp.time_since_epoch()
+                    )
+                        .count();
+                header->cache_timestamp_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        frame.debug_cache_timestamp.time_since_epoch()
+                    )
+                        .count();
+                generation.store(current_generation + 2, std::memory_order_release);
+                return cache_sequence_;
             }
             int fd_ { -1 };
             void* ptr_ { nullptr };
+            uint64_t cache_sequence_ = 0;
+            uint64_t last_capture_sequence_ = 0;
+            uint64_t last_detector_sequence_ = 0;
+            bool has_frame_ = false;
         };
         static writer w("/awakening_frame");
-        w.write(img);
+        return w.write(img, frame);
     }
 
     static void write_shm_to(const cv::Mat& img, const char* shm_name) {
@@ -820,8 +910,8 @@ void Web::draw(cv::Mat& img, const VisionDebugCtx& ctx) {
 void Web::write_debug_data(const VisionDebugCtx& ctx) {
     _impl->write_debug_data(ctx);
 }
-void Web::write_shm(const cv::Mat& img) {
-    _impl->write_shm(img);
+uint64_t Web::write_shm(const cv::Mat& img, const ImageFrame& frame) {
+    return _impl->write_shm(img, frame);
 }
 void Web::write_shm_to(const cv::Mat& img, const char* shm_name) {
     Impl::write_shm_to(img, shm_name);
